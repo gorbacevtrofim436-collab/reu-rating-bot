@@ -5,7 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 
 class UserStoreError(RuntimeError):
@@ -94,7 +94,11 @@ class UserStore:
                 return None
 
             login, encrypted_password = row
-            password = self.cipher.decrypt(bytes(encrypted_password)).decode("utf-8")
+            try:
+                password = self.cipher.decrypt(bytes(encrypted_password)).decode("utf-8")
+            except InvalidToken:
+                self.delete_credentials(telegram_user_id)
+                return None
             return ReaCredentials(login=login, password=password)
 
         with self._connect() as connection:
@@ -111,7 +115,11 @@ class UserStore:
             return None
 
         login, encrypted_password = row
-        password = self.cipher.decrypt(encrypted_password).decode("utf-8")
+        try:
+            password = self.cipher.decrypt(encrypted_password).decode("utf-8")
+        except InvalidToken:
+            self.delete_credentials(telegram_user_id)
+            return None
         return ReaCredentials(login=login, password=password)
 
     def save_credentials(

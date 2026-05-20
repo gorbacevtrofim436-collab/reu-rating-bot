@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -62,6 +63,14 @@ def _telegram_user_id(message: Message) -> int | None:
     return message.from_user.id if message.from_user else None
 
 
+def _store_backend_label() -> str:
+    current_store = _store()
+    if current_store.use_postgres:
+        host = urlparse(current_store.database_url).hostname or "unknown"
+        return f"postgres:{host}"
+    return f"sqlite:{current_store.db_path}"
+
+
 async def _delete_sensitive_message(message: Message) -> None:
     try:
         await message.delete()
@@ -82,7 +91,14 @@ async def start(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    if _store().get_credentials(user_id) is not None:
+    credentials = _store().get_credentials(user_id)
+    logging.info(
+        "Start credential check user_id=%s credentials_present=%s store=%s",
+        user_id,
+        credentials is not None,
+        _store_backend_label(),
+    )
+    if credentials is not None:
         await state.set_state(RatingStates.waiting_for_subject)
         await message.answer("Баллы по какому предмету вас интересуют?")
         return

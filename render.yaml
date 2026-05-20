@@ -11,6 +11,16 @@ services:
         value: webhook
       - key: PORT
         value: 10000
+      - key: MONITOR_ENABLED
+        value: true
+      - key: MONITOR_INTERVAL_SECONDS
+        value: 3600
+      - key: MONITOR_INITIAL_DELAY_SECONDS
+        value: 60
+      - key: MONITOR_USER_DELAY_SECONDS
+        value: 30
+      - key: MONITOR_JITTER_SECONDS
+        value: 60
       - key: BOT_TOKEN
         sync: false
       - key: BOT_CREDENTIAL_KEY

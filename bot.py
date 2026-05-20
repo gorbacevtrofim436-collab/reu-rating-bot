@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import random
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -16,7 +18,7 @@ from dotenv import load_dotenv
 
 from rating_client import RatingClient, RatingFetchError
 from rating_parser import RatingItem, RatingParseError, find_subject_score, parse_rating_html
-from user_store import UserStore, UserStoreError
+from user_store import RatingSnapshot, StoredCredentials, UserStore, UserStoreError
 
 
 router = Router()
@@ -29,6 +31,14 @@ class RatingStates(StatesGroup):
 
 
 store: UserStore | None = None
+
+RATING_FIELDS = (
+    ("attendance", "Работа на занятиях"),
+    ("control", "Текущий и рубежный контроль"),
+    ("creative", "Творческий рейтинг"),
+    ("intermediate", "Промежуточная аттестация"),
+    ("total", "Итого"),
+)
 
 
 def _allowed_user_id() -> int | None:
@@ -44,6 +54,23 @@ def _env_int(name: str) -> int | None:
         return int(value)
     except ValueError as exc:
         raise RatingParseError(f"{name} должен быть целым числом") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().casefold()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
 
 
 async def _is_allowed(message: Message) -> bool:
@@ -103,6 +130,33 @@ async def _log_event(
         )
     except Exception:
         logging.exception("Could not write bot event for user_id=%s", _telegram_user_id(message))
+
+
+async def _log_store_event(
+    *,
+    telegram_user_id: int | None,
+    event_type: str,
+    message_text: str | None = None,
+    subject_query: str | None = None,
+    subject_matched: str | None = None,
+    result_status: str | None = None,
+    response_text: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    try:
+        await asyncio.to_thread(
+            _store().log_event,
+            telegram_user_id=telegram_user_id,
+            event_type=event_type,
+            message_text=message_text,
+            subject_query=subject_query,
+            subject_matched=subject_matched,
+            result_status=result_status,
+            response_text=response_text,
+            error_message=error_message,
+        )
+    except Exception:
+        logging.exception("Could not write bot event for user_id=%s", telegram_user_id)
 
 
 @router.message(CommandStart())
@@ -251,7 +305,7 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         html = await asyncio.to_thread(
             RatingClient(login=login_value, password=password_value).fetch_html
         )
-        parse_rating_html(
+        items = parse_rating_html(
             html,
             table_selector=os.getenv("RATING_TABLE_SELECTOR") or None,
             table_index=_env_int("RATING_TABLE_INDEX"),
@@ -268,6 +322,11 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         telegram_user_id=user_id,
         rea_login=login_value,
         rea_password=password_value,
+    )
+    await asyncio.to_thread(
+        _store().replace_rating_snapshots,
+        telegram_user_id=user_id,
+        snapshots=rating_items_to_snapshots(items),
     )
     await state.set_state(RatingStates.waiting_for_subject)
     response = "Готово. Теперь напишите предмет, например: матан, англ, алгоритмы."
@@ -385,6 +444,207 @@ def format_rating_item(item: RatingItem) -> str:
     return f"{item.subject}: {item.total}"
 
 
+def rating_items_to_snapshots(items: list[RatingItem]) -> list[RatingSnapshot]:
+    return [
+        RatingSnapshot(
+            subject=item.subject,
+            total=_clean_rating_value(item.total),
+            attendance=_clean_optional_rating_value(item.attendance),
+            control=_clean_optional_rating_value(item.control),
+            creative=_clean_optional_rating_value(item.creative),
+            intermediate=_clean_optional_rating_value(item.intermediate),
+        )
+        for item in items
+    ]
+
+
+def _clean_rating_value(value: str | None) -> str:
+    return " ".join((value or "").split())
+
+
+def _clean_optional_rating_value(value: str | None) -> str | None:
+    cleaned = _clean_rating_value(value)
+    return cleaned or None
+
+
+def collect_rating_changes(
+    previous: dict[str, RatingSnapshot],
+    current_items: list[RatingItem],
+) -> dict[str, list[tuple[str, str, str]]]:
+    changes: dict[str, list[tuple[str, str, str]]] = {}
+    for item in current_items:
+        old_snapshot = previous.get(item.subject)
+        if old_snapshot is None:
+            continue
+
+        for field_name, label in RATING_FIELDS:
+            old_value = _clean_rating_value(getattr(old_snapshot, field_name))
+            new_value = _clean_rating_value(getattr(item, field_name))
+            if old_value != new_value:
+                changes.setdefault(item.subject, []).append(
+                    (label, _display_rating_value(old_value), _display_rating_value(new_value))
+                )
+
+    return changes
+
+
+def _display_rating_value(value: str) -> str:
+    return value or "-"
+
+
+def format_rating_change_notification(changes: dict[str, list[tuple[str, str, str]]]) -> str:
+    lines = ["Изменились баллы:"]
+    for subject, subject_changes in changes.items():
+        lines.append("")
+        lines.append(subject)
+        for label, old_value, new_value in subject_changes:
+            lines.append(f"{label}: было {old_value}, стало {new_value}")
+    return "\n".join(lines)
+
+
+def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = block
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def rating_monitor_loop(bot: Bot) -> None:
+    if not _env_bool("MONITOR_ENABLED", True):
+        logging.info("Rating monitor is disabled")
+        return
+
+    initial_delay = max(_env_float("MONITOR_INITIAL_DELAY_SECONDS", 60.0), 0.0)
+    interval = max(_env_float("MONITOR_INTERVAL_SECONDS", 3600.0), 60.0)
+    jitter = max(_env_float("MONITOR_JITTER_SECONDS", 60.0), 0.0)
+
+    logging.info(
+        "Rating monitor started: initial_delay=%s interval=%s jitter=%s",
+        initial_delay,
+        interval,
+        jitter,
+    )
+    await asyncio.sleep(initial_delay)
+
+    while True:
+        try:
+            await run_rating_monitor_cycle(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Rating monitor cycle failed")
+
+        sleep_for = interval + (random.uniform(0, jitter) if jitter else 0)
+        await asyncio.sleep(sleep_for)
+
+
+async def run_rating_monitor_cycle(bot: Bot) -> None:
+    credentials = await asyncio.to_thread(_store().list_credentials)
+    logging.info("Rating monitor cycle started for %s users", len(credentials))
+    await _log_store_event(
+        telegram_user_id=None,
+        event_type="rating_monitor",
+        result_status="cycle_started",
+        response_text=f"users={len(credentials)}",
+    )
+
+    user_delay = max(_env_float("MONITOR_USER_DELAY_SECONDS", 30.0), 0.0)
+    for index, credentials_item in enumerate(credentials):
+        await check_user_rating_changes(bot, credentials_item)
+        if user_delay and index < len(credentials) - 1:
+            await asyncio.sleep(user_delay)
+
+
+async def check_user_rating_changes(bot: Bot, credentials: StoredCredentials) -> None:
+    telegram_user_id = credentials.telegram_user_id
+    try:
+        html = await asyncio.to_thread(
+            RatingClient(login=credentials.login, password=credentials.password).fetch_html
+        )
+        items = parse_rating_html(
+            html,
+            table_selector=os.getenv("RATING_TABLE_SELECTOR") or None,
+            table_index=_env_int("RATING_TABLE_INDEX"),
+            subject_column_index=_env_int("SUBJECT_COLUMN_INDEX"),
+            score_column_index=_env_int("SCORE_COLUMN_INDEX"),
+        )
+        previous = await asyncio.to_thread(_store().get_rating_snapshots, telegram_user_id)
+        snapshots = rating_items_to_snapshots(items)
+
+        if not previous:
+            await asyncio.to_thread(
+                _store().replace_rating_snapshots,
+                telegram_user_id=telegram_user_id,
+                snapshots=snapshots,
+            )
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="rating_monitor",
+                result_status="baseline_saved",
+                response_text=f"subjects={len(snapshots)}",
+            )
+            return
+
+        changes = collect_rating_changes(previous, items)
+
+        if not changes:
+            await asyncio.to_thread(
+                _store().replace_rating_snapshots,
+                telegram_user_id=telegram_user_id,
+                snapshots=snapshots,
+            )
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="rating_monitor",
+                result_status="no_changes",
+                response_text=f"subjects={len(snapshots)}",
+            )
+            return
+
+        notification = format_rating_change_notification(changes)
+        for notification_part in split_telegram_text(notification):
+            await bot.send_message(chat_id=telegram_user_id, text=notification_part)
+        await asyncio.to_thread(
+            _store().replace_rating_snapshots,
+            telegram_user_id=telegram_user_id,
+            snapshots=snapshots,
+        )
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="rating_change",
+            result_status="notified",
+            response_text=notification,
+        )
+    except (RatingFetchError, RatingParseError) as exc:
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="rating_monitor",
+            result_status="fetch_failed",
+            error_message=str(exc),
+        )
+    except Exception as exc:
+        logging.exception("Rating monitor failed for user_id=%s", telegram_user_id)
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="rating_monitor",
+            result_status="failed",
+            error_message=str(exc),
+        )
+
+
 def create_dispatcher() -> Dispatcher:
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
@@ -428,6 +688,19 @@ async def on_webhook_startup(bot: Bot, dispatcher: Dispatcher) -> None:
     logging.info("Webhook set to %s", webhook_url)
 
 
+async def start_monitor_task(app: web.Application) -> None:
+    app["rating_monitor_task"] = asyncio.create_task(rating_monitor_loop(app["bot"]))
+
+
+async def stop_monitor_task(app: web.Application) -> None:
+    task = app.get("rating_monitor_task")
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 def run_webhook() -> None:
     global store
     store = UserStore()
@@ -436,6 +709,7 @@ def run_webhook() -> None:
     dispatcher.startup.register(on_webhook_startup)
 
     app = web.Application()
+    app["bot"] = bot
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     SimpleRequestHandler(
@@ -444,6 +718,8 @@ def run_webhook() -> None:
         secret_token=get_webhook_secret(),
     ).register(app, path="/webhook")
     setup_application(app, dispatcher, bot=bot)
+    app.on_startup.append(start_monitor_task)
+    app.on_cleanup.append(stop_monitor_task)
 
     port = int(os.getenv("PORT", "10000"))
     web.run_app(app, host="0.0.0.0", port=port)

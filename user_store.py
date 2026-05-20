@@ -18,6 +18,23 @@ class ReaCredentials:
     password: str
 
 
+@dataclass(frozen=True)
+class StoredCredentials:
+    telegram_user_id: int
+    login: str
+    password: str
+
+
+@dataclass(frozen=True)
+class RatingSnapshot:
+    subject: str
+    total: str
+    attendance: str | None = None
+    control: str | None = None
+    creative: str | None = None
+    intermediate: str | None = None
+
+
 class UserStore:
     def __init__(self) -> None:
         self.database_url = os.getenv("DATABASE_URL", "").strip()
@@ -89,6 +106,27 @@ class UserStore:
                         ON bot_events (telegram_user_id)
                         """
                     )
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS rating_snapshots (
+                            telegram_user_id BIGINT NOT NULL,
+                            subject TEXT NOT NULL,
+                            total TEXT NOT NULL,
+                            attendance TEXT,
+                            control TEXT,
+                            creative TEXT,
+                            intermediate TEXT,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (telegram_user_id, subject)
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_rating_snapshots_user_id
+                        ON rating_snapshots (telegram_user_id)
+                        """
+                    )
             return
 
         with self._connect() as connection:
@@ -129,6 +167,27 @@ class UserStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_bot_events_telegram_user_id
                 ON bot_events (telegram_user_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rating_snapshots (
+                    telegram_user_id INTEGER NOT NULL,
+                    subject TEXT NOT NULL,
+                    total TEXT NOT NULL,
+                    attendance TEXT,
+                    control TEXT,
+                    creative TEXT,
+                    intermediate TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (telegram_user_id, subject)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_rating_snapshots_user_id
+                ON rating_snapshots (telegram_user_id)
                 """
             )
 
@@ -240,6 +299,154 @@ class UserStore:
             return None
         return ReaCredentials(login=login, password=password)
 
+    def list_credentials(self) -> list[StoredCredentials]:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT telegram_user_id, rea_login, rea_password_encrypted
+                        FROM rea_credentials
+                        ORDER BY updated_at ASC
+                        """
+                    )
+                    rows = cursor.fetchall()
+        else:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT telegram_user_id, rea_login, rea_password_encrypted
+                    FROM rea_credentials
+                    ORDER BY updated_at ASC
+                    """
+                ).fetchall()
+
+        credentials: list[StoredCredentials] = []
+        invalid_user_ids: list[int] = []
+        for telegram_user_id, login, encrypted_password in rows:
+            try:
+                password = self.cipher.decrypt(bytes(encrypted_password)).decode("utf-8")
+            except InvalidToken:
+                invalid_user_ids.append(int(telegram_user_id))
+                continue
+            credentials.append(
+                StoredCredentials(
+                    telegram_user_id=int(telegram_user_id),
+                    login=login,
+                    password=password,
+                )
+            )
+
+        for telegram_user_id in invalid_user_ids:
+            self.delete_credentials(telegram_user_id)
+
+        return credentials
+
+    def get_rating_snapshots(self, telegram_user_id: int) -> dict[str, RatingSnapshot]:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT subject, total, attendance, control, creative, intermediate
+                        FROM rating_snapshots
+                        WHERE telegram_user_id = %s
+                        """,
+                        (telegram_user_id,),
+                    )
+                    rows = cursor.fetchall()
+        else:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT subject, total, attendance, control, creative, intermediate
+                    FROM rating_snapshots
+                    WHERE telegram_user_id = ?
+                    """,
+                    (telegram_user_id,),
+                ).fetchall()
+
+        return {
+            row[0]: RatingSnapshot(
+                subject=row[0],
+                total=row[1],
+                attendance=row[2],
+                control=row[3],
+                creative=row[4],
+                intermediate=row[5],
+            )
+            for row in rows
+        }
+
+    def replace_rating_snapshots(
+        self,
+        *,
+        telegram_user_id: int,
+        snapshots: list[RatingSnapshot],
+    ) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM rating_snapshots WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
+                    for snapshot in snapshots:
+                        cursor.execute(
+                            """
+                            INSERT INTO rating_snapshots (
+                                telegram_user_id,
+                                subject,
+                                total,
+                                attendance,
+                                control,
+                                creative,
+                                intermediate
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                telegram_user_id,
+                                snapshot.subject,
+                                snapshot.total,
+                                snapshot.attendance,
+                                snapshot.control,
+                                snapshot.creative,
+                                snapshot.intermediate,
+                            ),
+                        )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM rating_snapshots WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            for snapshot in snapshots:
+                connection.execute(
+                    """
+                    INSERT INTO rating_snapshots (
+                        telegram_user_id,
+                        subject,
+                        total,
+                        attendance,
+                        control,
+                        creative,
+                        intermediate
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        telegram_user_id,
+                        snapshot.subject,
+                        snapshot.total,
+                        snapshot.attendance,
+                        snapshot.control,
+                        snapshot.creative,
+                        snapshot.intermediate,
+                    ),
+                )
+
     def save_credentials(
         self,
         *,
@@ -293,11 +500,19 @@ class UserStore:
                         "DELETE FROM rea_credentials WHERE telegram_user_id = %s",
                         (telegram_user_id,),
                     )
+                    cursor.execute(
+                        "DELETE FROM rating_snapshots WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
             return
 
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM rea_credentials WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            connection.execute(
+                "DELETE FROM rating_snapshots WHERE telegram_user_id = ?",
                 (telegram_user_id,),
             )
 

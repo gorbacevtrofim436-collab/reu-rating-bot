@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+
+from cryptography.fernet import Fernet
+
+
+class UserStoreError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ReaCredentials:
+    login: str
+    password: str
+
+
+class UserStore:
+    def __init__(self) -> None:
+        self.database_url = os.getenv("DATABASE_URL", "").strip()
+        self.use_postgres = self.database_url.startswith(("postgres://", "postgresql://"))
+
+        if not self.use_postgres:
+            db_path = os.getenv("BOT_DB_PATH", "credentials.sqlite3")
+            self.db_path = Path(db_path)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        key = os.getenv("BOT_CREDENTIAL_KEY", "").strip()
+        if not key:
+            raise UserStoreError("BOT_CREDENTIAL_KEY не задан в .env")
+
+        self.cipher = Fernet(key.encode("utf-8"))
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.db_path)
+
+    def _pg_connect(self):
+        try:
+            import psycopg
+        except ImportError as exc:
+            raise UserStoreError("Для DATABASE_URL нужен пакет psycopg.") from exc
+
+        return psycopg.connect(self.database_url)
+
+    def _init_db(self) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS rea_credentials (
+                            telegram_user_id BIGINT PRIMARY KEY,
+                            rea_login TEXT NOT NULL,
+                            rea_password_encrypted BYTEA NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rea_credentials (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    rea_login TEXT NOT NULL,
+                    rea_password_encrypted BLOB NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+    def get_credentials(self, telegram_user_id: int) -> ReaCredentials | None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT rea_login, rea_password_encrypted
+                        FROM rea_credentials
+                        WHERE telegram_user_id = %s
+                        """,
+                        (telegram_user_id,),
+                    )
+                    row = cursor.fetchone()
+
+            if row is None:
+                return None
+
+            login, encrypted_password = row
+            password = self.cipher.decrypt(bytes(encrypted_password)).decode("utf-8")
+            return ReaCredentials(login=login, password=password)
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT rea_login, rea_password_encrypted
+                FROM rea_credentials
+                WHERE telegram_user_id = ?
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        login, encrypted_password = row
+        password = self.cipher.decrypt(encrypted_password).decode("utf-8")
+        return ReaCredentials(login=login, password=password)
+
+    def save_credentials(
+        self,
+        *,
+        telegram_user_id: int,
+        rea_login: str,
+        rea_password: str,
+    ) -> None:
+        encrypted_password = self.cipher.encrypt(rea_password.encode("utf-8"))
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO rea_credentials (
+                            telegram_user_id,
+                            rea_login,
+                            rea_password_encrypted
+                        )
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT(telegram_user_id) DO UPDATE SET
+                            rea_login = EXCLUDED.rea_login,
+                            rea_password_encrypted = EXCLUDED.rea_password_encrypted,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (telegram_user_id, rea_login, encrypted_password),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO rea_credentials (
+                    telegram_user_id,
+                    rea_login,
+                    rea_password_encrypted
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    rea_login = excluded.rea_login,
+                    rea_password_encrypted = excluded.rea_password_encrypted,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (telegram_user_id, rea_login, encrypted_password),
+            )
+
+    def delete_credentials(self, telegram_user_id: int) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM rea_credentials WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM rea_credentials WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )

@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: reu-rating-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: RUN_MODE
+        value: webhook
+      - key: PORT
+        value: 10000
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_CREDENTIAL_KEY
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: reu-rating-bot-db
+          property: connectionString
+      - key: REA_RATING_URL
+        value: https://student.rea.ru/rating/index.php?login=yes&semester=2-й+семестр
+      - key: REA_LOGIN_URL
+        value: https://student.rea.ru/
+      - key: REA_REQUEST_TIMEOUT
+        value: 30
+
+databases:
+  - name: reu-rating-bot-db
+    plan: free

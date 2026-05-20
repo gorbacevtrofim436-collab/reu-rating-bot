@@ -78,16 +78,47 @@ async def _delete_sensitive_message(message: Message) -> None:
         logging.info("Could not delete sensitive message from user_id=%s", _telegram_user_id(message))
 
 
+async def _log_event(
+    message: Message,
+    event_type: str,
+    *,
+    message_text: str | None = None,
+    subject_query: str | None = None,
+    subject_matched: str | None = None,
+    result_status: str | None = None,
+    response_text: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    try:
+        await asyncio.to_thread(
+            _store().log_event,
+            telegram_user_id=_telegram_user_id(message),
+            event_type=event_type,
+            message_text=message_text,
+            subject_query=subject_query,
+            subject_matched=subject_matched,
+            result_status=result_status,
+            response_text=response_text,
+            error_message=error_message,
+        )
+    except Exception:
+        logging.exception("Could not write bot event for user_id=%s", _telegram_user_id(message))
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     logging.info("Received /start from user_id=%s", message.from_user.id if message.from_user else None)
     if not await _is_allowed(message):
-        await message.answer("Доступ запрещен.")
+        response = "Доступ запрещен."
+        await _log_event(message, "command", message_text="/start", result_status="access_denied", response_text=response)
+        await message.answer(response)
         return
 
     user_id = _telegram_user_id(message)
     if user_id is None:
-        await message.answer("Не удалось определить пользователя Telegram.")
+        response = "Не удалось определить пользователя Telegram."
+        await _log_event(message, "command", message_text="/start", result_status="no_telegram_user", response_text=response)
+        await message.answer(response)
         return
 
     await state.clear()
@@ -100,76 +131,100 @@ async def start(message: Message, state: FSMContext) -> None:
     )
     if credentials is not None:
         await state.set_state(RatingStates.waiting_for_subject)
-        await message.answer("Баллы по какому предмету вас интересуют?")
+        response = "Баллы по какому предмету вас интересуют?"
+        await _log_event(message, "command", message_text="/start", result_status="credentials_found", response_text=response)
+        await message.answer(response)
         return
 
     await state.set_state(RatingStates.waiting_for_login)
-    await message.answer(
+    response = (
         "Введите логин от личного кабинета РЭУ.\n"
         "Команды: /login — сменить данные, /logout — удалить данные."
     )
+    await _log_event(message, "command", message_text="/start", result_status="login_required", response_text=response)
+    await message.answer(response)
 
 
 @router.message(Command("login"))
 async def login(message: Message, state: FSMContext) -> None:
     logging.info("Received /login from user_id=%s", _telegram_user_id(message))
     if not await _is_allowed(message):
-        await message.answer("Доступ запрещен.")
+        response = "Доступ запрещен."
+        await _log_event(message, "command", message_text="/login", result_status="access_denied", response_text=response)
+        await message.answer(response)
         return
 
     await state.clear()
     await state.set_state(RatingStates.waiting_for_login)
-    await message.answer("Введите логин от личного кабинета РЭУ.")
+    response = "Введите логин от личного кабинета РЭУ."
+    await _log_event(message, "command", message_text="/login", result_status="login_required", response_text=response)
+    await message.answer(response)
 
 
 @router.message(Command("logout"))
 async def logout(message: Message, state: FSMContext) -> None:
     logging.info("Received /logout from user_id=%s", _telegram_user_id(message))
     if not await _is_allowed(message):
-        await message.answer("Доступ запрещен.")
+        response = "Доступ запрещен."
+        await _log_event(message, "command", message_text="/logout", result_status="access_denied", response_text=response)
+        await message.answer(response)
         return
 
     user_id = _telegram_user_id(message)
     if user_id is not None:
         _store().delete_credentials(user_id)
     await state.clear()
-    await message.answer("Данные входа удалены. Для повторной настройки отправьте /start.")
+    response = "Данные входа удалены. Для повторной настройки отправьте /start."
+    await _log_event(message, "command", message_text="/logout", result_status="credentials_deleted", response_text=response)
+    await message.answer(response)
 
 
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
     logging.info("Received /cancel from user_id=%s", _telegram_user_id(message))
     await state.clear()
-    await message.answer("Действие отменено.")
+    response = "Действие отменено."
+    await _log_event(message, "command", message_text="/cancel", result_status="cancelled", response_text=response)
+    await message.answer(response)
 
 
 @router.message(RatingStates.waiting_for_login, F.text)
 async def handle_login(message: Message, state: FSMContext) -> None:
     logging.info("Received REA login from user_id=%s", _telegram_user_id(message))
     if not await _is_allowed(message):
-        await message.answer("Доступ запрещен.")
+        response = "Доступ запрещен."
+        await _log_event(message, "rea_login", result_status="access_denied", response_text=response)
+        await message.answer(response)
         return
 
     login_value = message.text.strip()
     if not login_value or login_value.startswith("/"):
-        await message.answer("Введите логин от личного кабинета РЭУ.")
+        response = "Введите логин от личного кабинета РЭУ."
+        await _log_event(message, "rea_login", message_text=login_value, result_status="invalid", response_text=response)
+        await message.answer(response)
         return
 
     await state.update_data(rea_login=login_value)
     await state.set_state(RatingStates.waiting_for_password)
-    await message.answer("Теперь введите пароль от личного кабинета РЭУ.")
+    response = "Теперь введите пароль от личного кабинета РЭУ."
+    await _log_event(message, "rea_login", message_text=login_value, result_status="accepted", response_text=response)
+    await message.answer(response)
 
 
 @router.message(RatingStates.waiting_for_password, F.text)
 async def handle_password(message: Message, state: FSMContext) -> None:
     logging.info("Received REA password from user_id=%s", _telegram_user_id(message))
     if not await _is_allowed(message):
-        await message.answer("Доступ запрещен.")
+        response = "Доступ запрещен."
+        await _log_event(message, "rea_password", result_status="access_denied", response_text=response)
+        await message.answer(response)
         return
 
     user_id = _telegram_user_id(message)
     if user_id is None:
-        await message.answer("Не удалось определить пользователя Telegram.")
+        response = "Не удалось определить пользователя Telegram."
+        await _log_event(message, "rea_password", result_status="no_telegram_user", response_text=response)
+        await message.answer(response)
         return
 
     data = await state.get_data()
@@ -179,12 +234,17 @@ async def handle_password(message: Message, state: FSMContext) -> None:
 
     if not login_value:
         await state.set_state(RatingStates.waiting_for_login)
-        await message.answer("Логин не найден. Введите логин заново.")
+        response = "Логин не найден. Введите логин заново."
+        await _log_event(message, "rea_password", result_status="missing_login", response_text=response)
+        await message.answer(response)
         return
     if not password_value or password_value.startswith("/"):
-        await message.answer("Введите пароль от личного кабинета РЭУ.")
+        response = "Введите пароль от личного кабинета РЭУ."
+        await _log_event(message, "rea_password", result_status="invalid_password_message", response_text=response)
+        await message.answer(response)
         return
 
+    await _log_event(message, "rea_password", result_status="check_started", response_text="Проверяю вход в личный кабинет...")
     await message.answer("Проверяю вход в личный кабинет...")
 
     try:
@@ -199,7 +259,9 @@ async def handle_password(message: Message, state: FSMContext) -> None:
             score_column_index=_env_int("SCORE_COLUMN_INDEX"),
         )
     except (RatingFetchError, RatingParseError) as exc:
-        await message.answer(f"Не удалось войти или получить рейтинг: {exc}")
+        response = f"Не удалось войти или получить рейтинг: {exc}"
+        await _log_event(message, "rea_login_result", result_status="failed", response_text=response, error_message=str(exc))
+        await message.answer(response)
         return
 
     _store().save_credentials(
@@ -208,7 +270,9 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         rea_password=password_value,
     )
     await state.set_state(RatingStates.waiting_for_subject)
-    await message.answer("Готово. Теперь напишите предмет, например: матан, англ, алгоритмы.")
+    response = "Готово. Теперь напишите предмет, например: матан, англ, алгоритмы."
+    await _log_event(message, "rea_login_result", message_text=login_value, result_status="success", response_text=response)
+    await message.answer(response)
 
 
 @router.message(RatingStates.waiting_for_subject, F.text)
@@ -227,22 +291,30 @@ async def handle_subject_without_state(message: Message) -> None:
 
 async def answer_subject(message: Message) -> None:
     if not await _is_allowed(message):
-        await message.answer("Доступ запрещен.")
+        response = "Доступ запрещен."
+        await _log_event(message, "subject_query", message_text=message.text, result_status="access_denied", response_text=response)
+        await message.answer(response)
         return
 
     subject_query = message.text.strip()
     if not subject_query:
-        await message.answer("Напишите название предмета.")
+        response = "Напишите название предмета."
+        await _log_event(message, "subject_query", message_text=message.text, result_status="empty_query", response_text=response)
+        await message.answer(response)
         return
 
     user_id = _telegram_user_id(message)
     if user_id is None:
-        await message.answer("Не удалось определить пользователя Telegram.")
+        response = "Не удалось определить пользователя Telegram."
+        await _log_event(message, "subject_query", message_text=subject_query, subject_query=subject_query, result_status="no_telegram_user", response_text=response)
+        await message.answer(response)
         return
 
     credentials = _store().get_credentials(user_id)
     if credentials is None:
-        await message.answer("Сначала нужно войти в личный кабинет. Отправьте /start.")
+        response = "Сначала нужно войти в личный кабинет. Отправьте /start."
+        await _log_event(message, "subject_query", message_text=subject_query, subject_query=subject_query, result_status="no_credentials", response_text=response)
+        await message.answer(response)
         return
 
     client = RatingClient(login=credentials.login, password=credentials.password)
@@ -257,17 +329,46 @@ async def answer_subject(message: Message) -> None:
             score_column_index=_env_int("SCORE_COLUMN_INDEX"),
         )
     except (RatingFetchError, RatingParseError) as exc:
-        await message.answer(f"Не удалось получить баллы: {exc}")
+        response = f"Не удалось получить баллы: {exc}"
+        await _log_event(
+            message,
+            "subject_query",
+            message_text=subject_query,
+            subject_query=subject_query,
+            result_status="fetch_failed",
+            response_text=response,
+            error_message=str(exc),
+        )
+        await message.answer(response)
         return
 
     item = find_subject_score(items, subject_query)
     if item is None:
         available = ", ".join(sorted({entry.subject for entry in items})[:10])
         suffix = f"\nДоступные предметы: {available}" if available else ""
-        await message.answer(f"Предмет не найден.{suffix}")
+        response = f"Предмет не найден.{suffix}"
+        await _log_event(
+            message,
+            "subject_query",
+            message_text=subject_query,
+            subject_query=subject_query,
+            result_status="not_found",
+            response_text=response,
+        )
+        await message.answer(response)
         return
 
-    await message.answer(format_rating_item(item))
+    response = format_rating_item(item)
+    await _log_event(
+        message,
+        "subject_query",
+        message_text=subject_query,
+        subject_query=subject_query,
+        subject_matched=item.subject,
+        result_status="found",
+        response_text=response,
+    )
+    await message.answer(response)
 
 
 def format_rating_item(item: RatingItem) -> str:

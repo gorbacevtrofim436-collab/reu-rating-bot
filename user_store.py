@@ -43,6 +43,13 @@ class SchedulePreference:
     schedule_metadata: str | None = None
 
 
+@dataclass(frozen=True)
+class ScheduleSnapshot:
+    telegram_user_id: int
+    schedule_hash: str
+    schedule_text: str
+
+
 class UserStore:
     def __init__(self) -> None:
         self.database_url = os.getenv("DATABASE_URL", "").strip()
@@ -147,6 +154,16 @@ class UserStore:
                         )
                         """
                     )
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS schedule_snapshots (
+                            telegram_user_id BIGINT PRIMARY KEY,
+                            schedule_hash TEXT NOT NULL,
+                            schedule_text TEXT NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
             return
 
         with self._connect() as connection:
@@ -218,6 +235,16 @@ class UserStore:
                     schedule_name TEXT NOT NULL,
                     schedule_metadata TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schedule_snapshots (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    schedule_hash TEXT NOT NULL,
+                    schedule_text TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -623,6 +650,83 @@ class UserStore:
                 (telegram_user_id,),
             )
 
+    def get_schedule_snapshot(self, telegram_user_id: int) -> ScheduleSnapshot | None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT schedule_hash, schedule_text
+                        FROM schedule_snapshots
+                        WHERE telegram_user_id = %s
+                        """,
+                        (telegram_user_id,),
+                    )
+                    row = cursor.fetchone()
+        else:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT schedule_hash, schedule_text
+                    FROM schedule_snapshots
+                    WHERE telegram_user_id = ?
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+
+        if row is None:
+            return None
+
+        return ScheduleSnapshot(
+            telegram_user_id=telegram_user_id,
+            schedule_hash=row[0],
+            schedule_text=row[1],
+        )
+
+    def save_schedule_snapshot(
+        self,
+        *,
+        telegram_user_id: int,
+        schedule_hash: str,
+        schedule_text: str,
+    ) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO schedule_snapshots (
+                            telegram_user_id,
+                            schedule_hash,
+                            schedule_text
+                        )
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT(telegram_user_id) DO UPDATE SET
+                            schedule_hash = EXCLUDED.schedule_hash,
+                            schedule_text = EXCLUDED.schedule_text,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (telegram_user_id, schedule_hash, schedule_text),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO schedule_snapshots (
+                    telegram_user_id,
+                    schedule_hash,
+                    schedule_text
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    schedule_hash = excluded.schedule_hash,
+                    schedule_text = excluded.schedule_text,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (telegram_user_id, schedule_hash, schedule_text),
+            )
+
     def delete_credentials(self, telegram_user_id: int) -> None:
         if self.use_postgres:
             with self._pg_connect() as connection:
@@ -639,6 +743,10 @@ class UserStore:
                         "DELETE FROM schedule_preferences WHERE telegram_user_id = %s",
                         (telegram_user_id,),
                     )
+                    cursor.execute(
+                        "DELETE FROM schedule_snapshots WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
             return
 
         with self._connect() as connection:
@@ -652,6 +760,10 @@ class UserStore:
             )
             connection.execute(
                 "DELETE FROM schedule_preferences WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            connection.execute(
+                "DELETE FROM schedule_snapshots WHERE telegram_user_id = ?",
                 (telegram_user_id,),
             )
 

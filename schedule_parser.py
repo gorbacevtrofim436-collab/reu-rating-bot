@@ -18,6 +18,7 @@ class ScheduleLesson:
     subject: str
     lesson_type: str | None = None
     place: str | None = None
+    teacher: str | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,8 @@ class ScheduleDay:
 class ScheduleWeek:
     week_num: int | None
     days: list[ScheduleDay]
+    group_name: str | None = None
+    updated_at: str | None = None
 
 
 DAY_ORDER = {
@@ -46,6 +49,65 @@ DAY_ORDER = {
 
 def parse_schedule_html(html: str) -> ScheduleWeek:
     soup = BeautifulSoup(html, "html.parser")
+    if soup.select_one("table.table_lessons") is not None:
+        return parse_student_lessons_html(soup)
+    return parse_rasp_lessons_html(soup)
+
+
+def parse_student_lessons_html(soup: BeautifulSoup) -> ScheduleWeek:
+    table = soup.select_one("table.table_lessons")
+    if table is None:
+        raise ScheduleParseError("Не найдена таблица расписания ЛКС.")
+
+    group_name, updated_at = _parse_student_heading(soup)
+    week_num: int | None = None
+    days: list[ScheduleDay] = []
+    current_day: ScheduleDay | None = None
+
+    for row in table.find_all("tr"):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) < 2:
+            continue
+
+        first_text = _clean_text(cells[0].get_text(" ", strip=True))
+        second_text = _clean_text(cells[1].get_text(" ", strip=True))
+
+        if "неделя" in first_text.casefold():
+            match = re.search(r"\d+", first_text)
+            if match:
+                week_num = int(match.group(0))
+
+        if _looks_like_day_title(second_text) and not cells[1].select_one(".lesson__block"):
+            weekday, date_value = _split_day_title(second_text)
+            current_day = ScheduleDay(
+                title=second_text,
+                weekday=weekday,
+                date=date_value,
+                lessons=[],
+            )
+            days.append(current_day)
+            continue
+
+        if current_day is None or not second_text or not cells[1].select_one(".lesson__block"):
+            continue
+
+        pair, start_time, end_time = _parse_time_cell(cells[0])
+        lesson = _parse_student_lesson_cell(cells[1], pair, start_time, end_time)
+        if lesson is not None:
+            current_day.lessons.append(lesson)
+
+    if not days:
+        raise ScheduleParseError("Не удалось разобрать расписание из ЛКС.")
+
+    return ScheduleWeek(
+        week_num=week_num,
+        days=sort_suggested_days(days),
+        group_name=group_name,
+        updated_at=updated_at,
+    )
+
+
+def parse_rasp_lessons_html(soup: BeautifulSoup) -> ScheduleWeek:
     week_num = _parse_week_num(soup)
     days: list[ScheduleDay] = []
 
@@ -107,22 +169,7 @@ def parse_schedule_html(html: str) -> ScheduleWeek:
     if not days:
         raise ScheduleParseError("Не удалось разобрать расписание из ответа сайта.")
 
-    return ScheduleWeek(week_num=week_num, days=days)
-
-
-def extract_group_candidates_from_rating_html(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    candidates: list[str] = []
-
-    for line in text.splitlines():
-        normalized_line = _clean_text(line)
-        if "группа" not in normalized_line.casefold():
-            continue
-        candidates.extend(_extract_group_like_values(normalized_line))
-
-    candidates.extend(_extract_group_like_values(text))
-    return _unique_preserving_order(candidates)[:10]
+    return ScheduleWeek(week_num=week_num, days=sort_suggested_days(days))
 
 
 def find_schedule_day(week: ScheduleWeek, day_query: str) -> ScheduleDay | None:
@@ -147,20 +194,22 @@ def format_schedule_day(day: ScheduleDay, *, group_name: str | None = None, week
 
     for lesson in day.lessons:
         lines.append("")
-        time_label = _format_lesson_time(lesson)
-        lines.append(time_label)
+        lines.append(_format_lesson_time(lesson))
         lines.append(lesson.subject)
         if lesson.lesson_type:
             lines.append(f"Тип: {lesson.lesson_type}")
         if lesson.place:
             lines.append(f"Место: {lesson.place}")
+        if lesson.teacher:
+            lines.append(f"Преподаватель: {lesson.teacher}")
     return "\n".join(lines)
 
 
 def format_schedule_week(week: ScheduleWeek, *, group_name: str | None = None) -> str:
     title = "Расписание на текущую неделю"
-    if group_name:
-        title += f" | {group_name}"
+    effective_group_name = group_name or week.group_name
+    if effective_group_name:
+        title += f" | {effective_group_name}"
     if week.week_num is not None:
         title += f" | {week.week_num} неделя"
 
@@ -170,8 +219,95 @@ def format_schedule_week(week: ScheduleWeek, *, group_name: str | None = None) -
     return "\n\n".join(parts)
 
 
+def schedule_snapshot_text(week: ScheduleWeek) -> str:
+    lines: list[str] = []
+    for day in week.days:
+        for lesson in day.lessons:
+            lines.append(format_schedule_snapshot_line(day, lesson))
+    return "\n".join(lines)
+
+
+def format_schedule_snapshot_line(day: ScheduleDay, lesson: ScheduleLesson) -> str:
+    parts = [
+        day.title.capitalize(),
+        _format_lesson_time(lesson),
+        lesson.subject,
+        lesson.lesson_type or "-",
+        lesson.place or "-",
+        lesson.teacher or "-",
+    ]
+    return " | ".join(_clean_text(part) for part in parts)
+
+
 def sort_suggested_days(days: list[ScheduleDay]) -> list[ScheduleDay]:
     return sorted(days, key=lambda day: DAY_ORDER.get(_normalize_day(day.weekday), 99))
+
+
+def _parse_student_heading(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+    headings = [_clean_text(heading.get_text(" ", strip=True)) for heading in soup.find_all("h1")]
+    text = next((heading for heading in headings if "Расписание для группы" in heading), "")
+    if not text:
+        return None, None
+    group_name = None
+    updated_at = None
+
+    group_match = re.search(r"Расписание\s+для\s+группы:\s*(.+?)(?:\s*\(|$)", text, flags=re.IGNORECASE)
+    if group_match:
+        group_name = _clean_text(group_match.group(1))
+
+    updated_match = re.search(r"обновлено\s+([^)]+)", text, flags=re.IGNORECASE)
+    if updated_match:
+        updated_at = _clean_text(updated_match.group(1))
+
+    return group_name, updated_at
+
+
+def _parse_student_lesson_cell(cell, pair: str, start_time: str | None, end_time: str | None) -> ScheduleLesson | None:
+    summary = cell.select_one(".lesson__block span")
+    if summary is None:
+        return None
+
+    summary_lines = _split_lines(summary.get_text("\n", strip=True))
+    if not summary_lines:
+        return None
+
+    subject = summary_lines[0]
+    place = _clean_place(summary_lines[1]) if len(summary_lines) > 1 else None
+    lesson_type = summary_lines[2] if len(summary_lines) > 2 else None
+
+    popup = cell.select_one(".lesson_popup")
+    teacher = _extract_teacher(popup.get_text("\n", strip=True) if popup is not None else "")
+    popup_place = _extract_label_value(popup.get_text("\n", strip=True), "Аудитория") if popup is not None else None
+
+    return ScheduleLesson(
+        pair=pair,
+        start_time=start_time,
+        end_time=end_time,
+        subject=subject,
+        lesson_type=lesson_type,
+        place=popup_place or place,
+        teacher=teacher,
+    )
+
+
+def _extract_teacher(text: str) -> str | None:
+    teachers: list[str] = []
+    for line in _split_lines(text):
+        if not line.casefold().startswith("преподаватель:"):
+            continue
+        value = _clean_text(line.split(":", 1)[1])
+        if value and value not in teachers:
+            teachers.append(value)
+    return ", ".join(teachers) if teachers else None
+
+
+def _extract_label_value(text: str, label: str) -> str | None:
+    label_prefix = f"{label}:".casefold()
+    for line in _split_lines(text):
+        if line.casefold().startswith(label_prefix):
+            value = _clean_text(line.split(":", 1)[1])
+            return value or None
+    return None
 
 
 def _parse_week_num(soup: BeautifulSoup) -> int | None:
@@ -189,18 +325,31 @@ def _split_day_title(title: str) -> tuple[str, str | None]:
     return _clean_text(weekday), _clean_text(date_value) or None
 
 
+def _looks_like_day_title(value: str) -> bool:
+    if "," not in value:
+        return False
+    weekday, _ = _split_day_title(value)
+    return _normalize_day(weekday) in DAY_ORDER
+
+
 def _parse_time_cell(cell) -> tuple[str, str | None, str | None]:
-    lines = [_clean_text(line) for line in cell.get_text("\n", strip=True).splitlines()]
-    lines = [line for line in lines if line]
+    lines = _split_lines(cell.get_text("\n", strip=True))
     pair = lines[0] if lines else "Пара"
-    start_time = lines[1] if len(lines) > 1 else None
-    end_time = lines[2] if len(lines) > 2 else None
+
+    start_time = None
+    end_time = None
+    if len(lines) > 1:
+        time_value = lines[1]
+        if "-" in time_value:
+            start_time, end_time = [_clean_text(part) for part in time_value.split("-", 1)]
+        else:
+            start_time = time_value
+            end_time = lines[2] if len(lines) > 2 else None
     return pair, start_time, end_time
 
 
 def _parse_task_text(raw_text: str) -> tuple[str, str | None, str | None] | None:
-    lines = [_clean_text(line) for line in raw_text.splitlines()]
-    lines = [line for line in lines if line]
+    lines = _split_lines(raw_text)
     if not lines:
         return None
 
@@ -216,31 +365,12 @@ def _format_lesson_time(lesson: ScheduleLesson) -> str:
     return lesson.pair
 
 
-def _extract_group_like_values(text: str) -> list[str]:
-    patterns = (
-        r"\b\d{2}\.\d{2}[A-Za-zА-Яа-яЁё0-9./-]*[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9./-]*\b",
-        r"\b[А-ЯЁA-Z]{1,8}[- ]?\d{1,3}[А-ЯЁA-Zа-яёa-z0-9./-]*\b",
-    )
-    values: list[str] = []
-    for pattern in patterns:
-        values.extend(re.findall(pattern, text))
-    return [_clean_text(value) for value in values if _clean_text(value)]
-
-
-def _unique_preserving_order(values: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        key = value.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(value)
-    return result
-
-
 def _normalize_day(value: str) -> str:
     return _clean_text(value).casefold()
+
+
+def _split_lines(value: str) -> list[str]:
+    return [_clean_text(line) for line in value.splitlines() if _clean_text(line)]
 
 
 def _clean_text(value: str) -> str:
@@ -250,4 +380,6 @@ def _clean_text(value: str) -> str:
 def _clean_place(value: str) -> str | None:
     cleaned = _clean_text(value)
     cleaned = cleaned.replace(" ,", ",").replace("- ,", "-")
+    if re.match(r"^\d+\s+корпус\s+", cleaned, flags=re.IGNORECASE):
+        cleaned = re.sub(r"^(\d+\s+корпус)\s+", r"\1 - ", cleaned, flags=re.IGNORECASE)
     return cleaned or None

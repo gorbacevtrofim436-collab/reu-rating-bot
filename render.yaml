@@ -41,7 +41,7 @@ services:
         value: https://student.rea.ru/
       - key: REA_REQUEST_TIMEOUT
         value: 30
-      - key: REA_SCHEDULE_URL
-        value: https://rasp.rea.ru
+      - key: REA_LESSONS_URL
+        value: https://student.rea.ru/lessons/index.php?login=yes
       - key: REA_SCHEDULE_REQUEST_TIMEOUT
         value: 30

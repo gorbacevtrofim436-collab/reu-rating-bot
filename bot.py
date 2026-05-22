@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
 import os
 import random
@@ -522,9 +523,13 @@ def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
     return chunks
 
 
-async def rating_monitor_loop(bot: Bot) -> None:
+async def rating_monitor_loop(app: web.Application) -> None:
     if not _env_bool("MONITOR_ENABLED", True):
         logging.info("Rating monitor is disabled")
+        return
+
+    if not _env_bool("MONITOR_BACKGROUND_ENABLED", False):
+        logging.info("Background rating monitor is disabled")
         return
 
     initial_delay = max(_env_float("MONITOR_INITIAL_DELAY_SECONDS", 60.0), 0.0)
@@ -541,7 +546,7 @@ async def rating_monitor_loop(bot: Bot) -> None:
 
     while True:
         try:
-            await run_rating_monitor_cycle(bot)
+            await run_locked_rating_monitor_cycle(app, source="background")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -551,14 +556,30 @@ async def rating_monitor_loop(bot: Bot) -> None:
         await asyncio.sleep(sleep_for)
 
 
-async def run_rating_monitor_cycle(bot: Bot) -> None:
+async def run_locked_rating_monitor_cycle(app: web.Application, *, source: str) -> bool:
+    lock = app["rating_monitor_lock"]
+    if lock.locked():
+        await _log_store_event(
+            telegram_user_id=None,
+            event_type="rating_monitor",
+            result_status="already_running",
+            response_text=f"source={source}",
+        )
+        return False
+
+    async with lock:
+        await run_rating_monitor_cycle(app["bot"], source=source)
+        return True
+
+
+async def run_rating_monitor_cycle(bot: Bot, *, source: str) -> None:
     credentials = await asyncio.to_thread(_store().list_credentials)
-    logging.info("Rating monitor cycle started for %s users", len(credentials))
+    logging.info("Rating monitor cycle started from %s for %s users", source, len(credentials))
     await _log_store_event(
         telegram_user_id=None,
         event_type="rating_monitor",
         result_status="cycle_started",
-        response_text=f"users={len(credentials)}",
+        response_text=f"source={source} users={len(credentials)}",
     )
 
     user_delay = max(_env_float("MONITOR_USER_DELAY_SECONDS", 30.0), 0.0)
@@ -674,8 +695,43 @@ def get_webhook_secret() -> str:
     return secret
 
 
+def get_monitor_run_secret() -> str:
+    secret = os.getenv("MONITOR_RUN_SECRET", "").strip()
+    if not secret:
+        raise RuntimeError("MONITOR_RUN_SECRET не задан в переменных окружения")
+    return secret
+
+
 async def health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "reu-rating-bot"})
+
+
+async def trigger_monitor_run(request: web.Request) -> web.Response:
+    if not _env_bool("MONITOR_ENABLED", True):
+        return web.json_response({"status": "disabled"}, status=503)
+
+    expected_secret = get_monitor_run_secret()
+    received_secret = request.headers.get("X-Monitor-Secret", "")
+    if not hmac.compare_digest(received_secret, expected_secret):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    existing_task = request.app.get("manual_rating_monitor_task")
+    if existing_task is not None and not existing_task.done():
+        return web.json_response({"status": "already_running"}, status=202)
+
+    task = asyncio.create_task(run_locked_rating_monitor_cycle(request.app, source="http"))
+    request.app["manual_rating_monitor_task"] = task
+    task.add_done_callback(_log_manual_monitor_task_result)
+    return web.json_response({"status": "started"}, status=202)
+
+
+def _log_manual_monitor_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logging.info("Manual rating monitor task was cancelled")
+    except Exception:
+        logging.exception("Manual rating monitor task failed")
 
 
 async def on_webhook_startup(bot: Bot, dispatcher: Dispatcher) -> None:
@@ -689,7 +745,7 @@ async def on_webhook_startup(bot: Bot, dispatcher: Dispatcher) -> None:
 
 
 async def start_monitor_task(app: web.Application) -> None:
-    app["rating_monitor_task"] = asyncio.create_task(rating_monitor_loop(app["bot"]))
+    app["rating_monitor_task"] = asyncio.create_task(rating_monitor_loop(app))
 
 
 async def stop_monitor_task(app: web.Application) -> None:
@@ -710,8 +766,10 @@ def run_webhook() -> None:
 
     app = web.Application()
     app["bot"] = bot
+    app["rating_monitor_lock"] = asyncio.Lock()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    app.router.add_post("/monitor/run", trigger_monitor_run)
     SimpleRequestHandler(
         dispatcher=dispatcher,
         bot=bot,

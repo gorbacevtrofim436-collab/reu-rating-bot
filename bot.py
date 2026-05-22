@@ -12,13 +12,22 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 from dotenv import load_dotenv
 
 from rating_client import RatingClient, RatingFetchError
 from rating_parser import RatingItem, RatingParseError, find_subject_score, parse_rating_html
+from schedule_client import ScheduleClient, ScheduleFetchError, ScheduleSuggestion
+from schedule_parser import (
+    ScheduleParseError,
+    extract_group_candidates_from_rating_html,
+    find_schedule_day,
+    format_schedule_day,
+    format_schedule_week,
+    parse_schedule_html,
+)
 from user_store import RatingSnapshot, StoredCredentials, UserStore, UserStoreError
 
 
@@ -29,6 +38,9 @@ class RatingStates(StatesGroup):
     waiting_for_login = State()
     waiting_for_password = State()
     waiting_for_subject = State()
+    waiting_for_schedule_group = State()
+    waiting_for_schedule_group_choice = State()
+    waiting_for_schedule_day = State()
 
 
 store: UserStore | None = None
@@ -40,6 +52,18 @@ RATING_FIELDS = (
     ("intermediate", "Промежуточная аттестация"),
     ("total", "Итого"),
 )
+
+SCHEDULE_TRIGGER_TEXTS = {"расписание", "расписание пар", "schedule"}
+SCHEDULE_DAY_BUTTONS = (
+    "Понедельник",
+    "Вторник",
+    "Среда",
+    "Четверг",
+    "Пятница",
+    "Суббота",
+    "Полное расписание",
+)
+SCHEDULE_FULL_TEXT = "полное расписание"
 
 
 def _allowed_user_id() -> int | None:
@@ -97,6 +121,49 @@ def _store_backend_label() -> str:
         host = urlparse(current_store.database_url).hostname or "unknown"
         return f"postgres:{host}"
     return f"sqlite:{current_store.db_path}"
+
+
+def _normalize_message_text(value: str | None) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def _is_schedule_request(value: str | None) -> bool:
+    return _normalize_message_text(value).lstrip("/") in SCHEDULE_TRIGGER_TEXTS
+
+
+def _is_full_schedule_request(value: str | None) -> bool:
+    return _normalize_message_text(value) == SCHEDULE_FULL_TEXT
+
+
+def _schedule_day_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Понедельник"), KeyboardButton(text="Вторник")],
+            [KeyboardButton(text="Среда"), KeyboardButton(text="Четверг")],
+            [KeyboardButton(text="Пятница"), KeyboardButton(text="Суббота")],
+            [KeyboardButton(text="Полное расписание")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def _schedule_group_keyboard(suggestions: list[ScheduleSuggestion]) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=suggestion.name)] for suggestion in suggestions],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def _is_known_schedule_day(value: str | None) -> bool:
+    normalized = _normalize_message_text(value)
+    return normalized in {_normalize_message_text(day) for day in SCHEDULE_DAY_BUTTONS}
+
+
+def _looks_like_group_suggestion(suggestion: ScheduleSuggestion) -> bool:
+    haystack = f"{suggestion.name} {suggestion.key} {suggestion.metadata or ''}".casefold()
+    return any(marker in haystack for marker in ("курс", "бакалавр", "магистр", "специалист", "факультет"))
 
 
 async def _delete_sensitive_message(message: Message) -> None:
@@ -231,7 +298,42 @@ async def logout(message: Message, state: FSMContext) -> None:
     await state.clear()
     response = "Данные входа удалены. Для повторной настройки отправьте /start."
     await _log_event(message, "command", message_text="/logout", result_status="credentials_deleted", response_text=response)
-    await message.answer(response)
+    await message.answer(response, reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Command("schedule"))
+async def schedule_command(message: Message, state: FSMContext) -> None:
+    logging.info("Received /schedule from user_id=%s", _telegram_user_id(message))
+    await start_schedule_flow(message, state)
+
+
+@router.message(Command("schedule_reset"))
+async def schedule_reset(message: Message, state: FSMContext) -> None:
+    logging.info("Received /schedule_reset from user_id=%s", _telegram_user_id(message))
+    if not await _is_allowed(message):
+        response = "Доступ запрещен."
+        await _log_event(message, "schedule_reset", result_status="access_denied", response_text=response)
+        await message.answer(response)
+        return
+
+    user_id = _telegram_user_id(message)
+    if user_id is None:
+        response = "Не удалось определить пользователя Telegram."
+        await _log_event(message, "schedule_reset", result_status="no_telegram_user", response_text=response)
+        await message.answer(response)
+        return
+    if _store().get_credentials(user_id) is None:
+        await state.set_state(RatingStates.waiting_for_login)
+        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        await _log_event(message, "schedule_reset", result_status="login_required", response_text=response)
+        await message.answer(response, reply_markup=ReplyKeyboardRemove())
+        return
+
+    _store().delete_schedule_preference(user_id)
+    await state.set_state(RatingStates.waiting_for_schedule_group)
+    response = "Группа для расписания сброшена. Введите номер своей группы."
+    await _log_event(message, "schedule_reset", result_status="deleted", response_text=response)
+    await message.answer(response, reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Command("cancel"))
@@ -240,7 +342,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     response = "Действие отменено."
     await _log_event(message, "command", message_text="/cancel", result_status="cancelled", response_text=response)
-    await message.answer(response)
+    await message.answer(response, reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(RatingStates.waiting_for_login, F.text)
@@ -335,18 +437,366 @@ async def handle_password(message: Message, state: FSMContext) -> None:
     await message.answer(response)
 
 
+@router.message(RatingStates.waiting_for_schedule_group, F.text)
+async def handle_schedule_group(message: Message, state: FSMContext) -> None:
+    logging.info("Received schedule group query from user_id=%s", _telegram_user_id(message))
+    if not await _is_allowed(message):
+        response = "Доступ запрещен."
+        await _log_event(message, "schedule_group", result_status="access_denied", response_text=response)
+        await message.answer(response)
+        return
+
+    user_id = _telegram_user_id(message)
+    if user_id is None:
+        response = "Не удалось определить пользователя Telegram."
+        await _log_event(message, "schedule_group", result_status="no_telegram_user", response_text=response)
+        await message.answer(response)
+        return
+    if _store().get_credentials(user_id) is None:
+        await state.set_state(RatingStates.waiting_for_login)
+        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        await _log_event(message, "schedule_group", result_status="login_required", response_text=response)
+        await message.answer(response, reply_markup=ReplyKeyboardRemove())
+        return
+
+    query = message.text.strip()
+    if not query or query.startswith("/"):
+        response = "Введите номер своей группы."
+        await _log_event(message, "schedule_group", message_text=query, result_status="invalid", response_text=response)
+        await message.answer(response)
+        return
+
+    try:
+        suggestions = await asyncio.to_thread(ScheduleClient().search_suggestions, query)
+    except ScheduleFetchError as exc:
+        response = f"Не удалось найти группу: {exc}"
+        await _log_event(
+            message,
+            "schedule_group",
+            message_text=query,
+            result_status="fetch_failed",
+            response_text=response,
+            error_message=str(exc),
+        )
+        await message.answer(response)
+        return
+
+    group_suggestions = [suggestion for suggestion in suggestions if _looks_like_group_suggestion(suggestion)]
+    if not group_suggestions:
+        response = (
+            "Группа не найдена. Введите номер группы точно как на сайте расписания, "
+            "например 15.07В-ЭФ1/25б."
+        )
+        await _log_event(message, "schedule_group", message_text=query, result_status="not_found", response_text=response)
+        await message.answer(response)
+        return
+
+    selected = _pick_schedule_suggestion(query, group_suggestions)
+    if selected is not None:
+        await save_schedule_preference_from_suggestion(message, selected)
+        await ask_schedule_day(message, state, prefix=f"Группа сохранена: {selected.name}.")
+        return
+
+    limited_suggestions = group_suggestions[:8]
+    await state.update_data(
+        schedule_suggestions=[
+            {
+                "name": suggestion.name,
+                "key": suggestion.key,
+                "metadata": suggestion.metadata,
+            }
+            for suggestion in limited_suggestions
+        ]
+    )
+    await state.set_state(RatingStates.waiting_for_schedule_group_choice)
+    response = "Нашел несколько вариантов. Выберите свою группу:"
+    await _log_event(
+        message,
+        "schedule_group",
+        message_text=query,
+        result_status="multiple_found",
+        response_text=response,
+    )
+    await message.answer(response, reply_markup=_schedule_group_keyboard(limited_suggestions))
+
+
+@router.message(RatingStates.waiting_for_schedule_group_choice, F.text)
+async def handle_schedule_group_choice(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    raw_suggestions = data.get("schedule_suggestions") or []
+    suggestions = [
+        ScheduleSuggestion(
+            name=str(item.get("name") or ""),
+            key=str(item.get("key") or ""),
+            metadata=str(item.get("metadata") or "") or None,
+        )
+        for item in raw_suggestions
+        if isinstance(item, dict)
+    ]
+    selected = _pick_schedule_suggestion(message.text.strip(), suggestions)
+    if selected is None:
+        await state.set_state(RatingStates.waiting_for_schedule_group)
+        await handle_schedule_group(message, state)
+        return
+
+    await save_schedule_preference_from_suggestion(message, selected)
+    await ask_schedule_day(message, state, prefix=f"Группа сохранена: {selected.name}.")
+
+
+@router.message(RatingStates.waiting_for_schedule_day, F.text)
+async def handle_schedule_day(message: Message, state: FSMContext) -> None:
+    logging.info("Received schedule day query from user_id=%s", _telegram_user_id(message))
+    if not await _is_allowed(message):
+        response = "Доступ запрещен."
+        await _log_event(message, "schedule_day", result_status="access_denied", response_text=response)
+        await message.answer(response)
+        return
+
+    day_query = message.text.strip()
+    if not _is_known_schedule_day(day_query):
+        response = "Выберите день текущей недели кнопкой ниже."
+        await _log_event(
+            message,
+            "schedule_day",
+            message_text=day_query,
+            result_status="invalid_day",
+            response_text=response,
+        )
+        await message.answer(response, reply_markup=_schedule_day_keyboard())
+        return
+
+    user_id = _telegram_user_id(message)
+    if user_id is None:
+        response = "Не удалось определить пользователя Telegram."
+        await _log_event(message, "schedule_day", result_status="no_telegram_user", response_text=response)
+        await message.answer(response, reply_markup=ReplyKeyboardRemove())
+        return
+    if _store().get_credentials(user_id) is None:
+        await state.set_state(RatingStates.waiting_for_login)
+        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        await _log_event(message, "schedule_day", result_status="login_required", response_text=response)
+        await message.answer(response, reply_markup=ReplyKeyboardRemove())
+        return
+
+    preference = _store().get_schedule_preference(user_id)
+    if preference is None:
+        await state.set_state(RatingStates.waiting_for_schedule_group)
+        response = "Сначала нужно указать группу. Введите номер своей группы."
+        await _log_event(message, "schedule_day", result_status="no_group", response_text=response)
+        await message.answer(response, reply_markup=ReplyKeyboardRemove())
+        return
+
+    try:
+        html = await asyncio.to_thread(ScheduleClient().fetch_week_html, preference.schedule_key)
+        week = parse_schedule_html(html)
+    except (ScheduleFetchError, ScheduleParseError) as exc:
+        response = f"Не удалось получить расписание: {exc}"
+        await _log_event(
+            message,
+            "schedule_day",
+            message_text=day_query,
+            result_status="fetch_failed",
+            response_text=response,
+            error_message=str(exc),
+        )
+        await message.answer(response, reply_markup=ReplyKeyboardRemove())
+        await state.set_state(RatingStates.waiting_for_subject)
+        return
+
+    if _is_full_schedule_request(day_query):
+        response = format_schedule_week(week, group_name=preference.schedule_name)
+    else:
+        day = find_schedule_day(week, day_query)
+        if day is None:
+            response = "На сайте расписания нет выбранного дня для текущей недели."
+        else:
+            response = format_schedule_day(
+                day,
+                group_name=preference.schedule_name,
+                week_num=week.week_num,
+            )
+
+    await _log_event(
+        message,
+        "schedule_day",
+        message_text=day_query,
+        result_status="found",
+        response_text=response,
+    )
+    for index, response_part in enumerate(split_telegram_text(response)):
+        await message.answer(
+            response_part,
+            reply_markup=ReplyKeyboardRemove() if index == 0 else None,
+        )
+    await state.set_state(RatingStates.waiting_for_subject)
+
+
 @router.message(RatingStates.waiting_for_subject, F.text)
-async def handle_subject(message: Message) -> None:
+async def handle_subject(message: Message, state: FSMContext) -> None:
     logging.info("Received subject query from user_id=%s", message.from_user.id if message.from_user else None)
+    if _is_schedule_request(message.text):
+        await start_schedule_flow(message, state)
+        return
     await answer_subject(message)
 
 
 @router.message(F.text)
-async def handle_subject_without_state(message: Message) -> None:
+async def handle_subject_without_state(message: Message, state: FSMContext) -> None:
     logging.info("Received stateless subject query from user_id=%s", message.from_user.id if message.from_user else None)
     if message.text and message.text.startswith("/"):
         return
+    if _is_schedule_request(message.text):
+        await start_schedule_flow(message, state)
+        return
     await answer_subject(message)
+
+
+async def start_schedule_flow(message: Message, state: FSMContext) -> None:
+    if not await _is_allowed(message):
+        response = "Доступ запрещен."
+        await _log_event(message, "schedule_start", result_status="access_denied", response_text=response)
+        await message.answer(response)
+        return
+
+    user_id = _telegram_user_id(message)
+    if user_id is None:
+        response = "Не удалось определить пользователя Telegram."
+        await _log_event(message, "schedule_start", result_status="no_telegram_user", response_text=response)
+        await message.answer(response)
+        return
+
+    credentials = _store().get_credentials(user_id)
+    if credentials is None:
+        await state.set_state(RatingStates.waiting_for_login)
+        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        await _log_event(message, "schedule_start", result_status="login_required", response_text=response)
+        await message.answer(response, reply_markup=ReplyKeyboardRemove())
+        return
+
+    preference = _store().get_schedule_preference(user_id)
+    if preference is not None:
+        await ask_schedule_day(message, state)
+        return
+
+    detected_suggestion = await detect_schedule_group_from_rating(message, credentials)
+    if detected_suggestion is not None:
+        await save_schedule_preference_from_suggestion(message, detected_suggestion)
+        await ask_schedule_day(message, state, prefix=f"Нашел вашу группу: {detected_suggestion.name}.")
+        return
+
+    await state.set_state(RatingStates.waiting_for_schedule_group)
+    response = (
+        "Не смог автоматически определить группу из рейтинга. "
+        "Введите номер своей группы, чтобы я сохранил ее для расписания."
+    )
+    await _log_event(message, "schedule_start", result_status="group_required", response_text=response)
+    await message.answer(response, reply_markup=ReplyKeyboardRemove())
+
+
+async def detect_schedule_group_from_rating(
+    message: Message,
+    credentials,
+) -> ScheduleSuggestion | None:
+    try:
+        html = await asyncio.to_thread(
+            RatingClient(login=credentials.login, password=credentials.password).fetch_html
+        )
+    except RatingFetchError as exc:
+        await _log_event(
+            message,
+            "schedule_group_autodetect",
+            result_status="rating_fetch_failed",
+            error_message=str(exc),
+        )
+        return None
+
+    candidates = extract_group_candidates_from_rating_html(html)
+    if not candidates:
+        await _log_event(message, "schedule_group_autodetect", result_status="no_candidates")
+        return None
+
+    for candidate in candidates:
+        try:
+            suggestions = await asyncio.to_thread(ScheduleClient().search_suggestions, candidate)
+        except ScheduleFetchError:
+            continue
+        group_suggestions = [suggestion for suggestion in suggestions if _looks_like_group_suggestion(suggestion)]
+        selected = _pick_schedule_suggestion(candidate, group_suggestions)
+        if selected is not None:
+            await _log_event(
+                message,
+                "schedule_group_autodetect",
+                subject_query=candidate,
+                subject_matched=selected.name,
+                result_status="found",
+            )
+            return selected
+
+    await _log_event(
+        message,
+        "schedule_group_autodetect",
+        result_status="not_found",
+        response_text=", ".join(candidates),
+    )
+    return None
+
+
+async def ask_schedule_day(message: Message, state: FSMContext, *, prefix: str | None = None) -> None:
+    await state.set_state(RatingStates.waiting_for_schedule_day)
+    response = "Какой день текущей недели вас интересует?"
+    if prefix:
+        response = f"{prefix}\n{response}"
+    await _log_event(message, "schedule_start", result_status="day_requested", response_text=response)
+    await message.answer(response, reply_markup=_schedule_day_keyboard())
+
+
+async def save_schedule_preference_from_suggestion(
+    message: Message,
+    suggestion: ScheduleSuggestion,
+) -> None:
+    user_id = _telegram_user_id(message)
+    if user_id is None:
+        return
+    await asyncio.to_thread(
+        _store().save_schedule_preference,
+        telegram_user_id=user_id,
+        schedule_key=suggestion.key,
+        schedule_name=suggestion.name,
+        schedule_metadata=suggestion.metadata,
+    )
+    await _log_event(
+        message,
+        "schedule_group_saved",
+        subject_matched=suggestion.name,
+        result_status="saved",
+    )
+
+
+def _pick_schedule_suggestion(
+    query: str,
+    suggestions: list[ScheduleSuggestion],
+) -> ScheduleSuggestion | None:
+    if not suggestions:
+        return None
+
+    normalized_query = _normalize_schedule_key(query)
+    exact_matches = [
+        suggestion
+        for suggestion in suggestions
+        if _normalize_schedule_key(suggestion.name) == normalized_query
+        or _normalize_schedule_key(suggestion.key) == normalized_query
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    if len(suggestions) == 1:
+        return suggestions[0]
+
+    return None
+
+
+def _normalize_schedule_key(value: str) -> str:
+    return _normalize_message_text(value).replace(" ", "")
 
 
 async def answer_subject(message: Message) -> None:

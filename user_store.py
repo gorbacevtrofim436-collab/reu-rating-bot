@@ -35,6 +35,14 @@ class RatingSnapshot:
     intermediate: str | None = None
 
 
+@dataclass(frozen=True)
+class SchedulePreference:
+    telegram_user_id: int
+    schedule_key: str
+    schedule_name: str
+    schedule_metadata: str | None = None
+
+
 class UserStore:
     def __init__(self) -> None:
         self.database_url = os.getenv("DATABASE_URL", "").strip()
@@ -127,6 +135,18 @@ class UserStore:
                         ON rating_snapshots (telegram_user_id)
                         """
                     )
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS schedule_preferences (
+                            telegram_user_id BIGINT PRIMARY KEY,
+                            schedule_key TEXT NOT NULL,
+                            schedule_name TEXT NOT NULL,
+                            schedule_metadata TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
             return
 
         with self._connect() as connection:
@@ -188,6 +208,18 @@ class UserStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_rating_snapshots_user_id
                 ON rating_snapshots (telegram_user_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schedule_preferences (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    schedule_key TEXT NOT NULL,
+                    schedule_name TEXT NOT NULL,
+                    schedule_metadata TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
                 """
             )
 
@@ -492,6 +524,105 @@ class UserStore:
                 (telegram_user_id, rea_login, encrypted_password),
             )
 
+    def get_schedule_preference(self, telegram_user_id: int) -> SchedulePreference | None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT schedule_key, schedule_name, schedule_metadata
+                        FROM schedule_preferences
+                        WHERE telegram_user_id = %s
+                        """,
+                        (telegram_user_id,),
+                    )
+                    row = cursor.fetchone()
+        else:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT schedule_key, schedule_name, schedule_metadata
+                    FROM schedule_preferences
+                    WHERE telegram_user_id = ?
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+
+        if row is None:
+            return None
+
+        return SchedulePreference(
+            telegram_user_id=telegram_user_id,
+            schedule_key=row[0],
+            schedule_name=row[1],
+            schedule_metadata=row[2],
+        )
+
+    def save_schedule_preference(
+        self,
+        *,
+        telegram_user_id: int,
+        schedule_key: str,
+        schedule_name: str,
+        schedule_metadata: str | None = None,
+    ) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO schedule_preferences (
+                            telegram_user_id,
+                            schedule_key,
+                            schedule_name,
+                            schedule_metadata
+                        )
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT(telegram_user_id) DO UPDATE SET
+                            schedule_key = EXCLUDED.schedule_key,
+                            schedule_name = EXCLUDED.schedule_name,
+                            schedule_metadata = EXCLUDED.schedule_metadata,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (telegram_user_id, schedule_key, schedule_name, schedule_metadata),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO schedule_preferences (
+                    telegram_user_id,
+                    schedule_key,
+                    schedule_name,
+                    schedule_metadata
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    schedule_key = excluded.schedule_key,
+                    schedule_name = excluded.schedule_name,
+                    schedule_metadata = excluded.schedule_metadata,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (telegram_user_id, schedule_key, schedule_name, schedule_metadata),
+            )
+
+    def delete_schedule_preference(self, telegram_user_id: int) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM schedule_preferences WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM schedule_preferences WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+
     def delete_credentials(self, telegram_user_id: int) -> None:
         if self.use_postgres:
             with self._pg_connect() as connection:
@@ -504,6 +635,10 @@ class UserStore:
                         "DELETE FROM rating_snapshots WHERE telegram_user_id = %s",
                         (telegram_user_id,),
                     )
+                    cursor.execute(
+                        "DELETE FROM schedule_preferences WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
             return
 
         with self._connect() as connection:
@@ -513,6 +648,10 @@ class UserStore:
             )
             connection.execute(
                 "DELETE FROM rating_snapshots WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            connection.execute(
+                "DELETE FROM schedule_preferences WHERE telegram_user_id = ?",
                 (telegram_user_id,),
             )
 

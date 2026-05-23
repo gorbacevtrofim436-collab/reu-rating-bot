@@ -14,7 +14,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import BotCommand, FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 from dotenv import load_dotenv
@@ -70,6 +70,12 @@ SCHEDULE_DAY_BUTTONS = (
 )
 SCHEDULE_FULL_TEXT = "полное расписание"
 WELCOME_IMAGE_PATH = Path(__file__).resolve().parent / "assets" / "reu_bot_avatar.png"
+BOT_DESCRIPTION = (
+    "РЭУ в кармане: баллы и расписание без лишних заходов в ЛКС. "
+    "Выберите предмет или день недели — бот сразу покажет актуальные данные "
+    "и предупредит, если изменятся баллы или пары. Один вход — дальше все под рукой."
+)
+BOT_SHORT_DESCRIPTION = "Баллы, расписание и уведомления РЭУ"
 
 
 def _allowed_user_id() -> int | None:
@@ -165,6 +171,15 @@ def _action_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _subject_keyboard(items: list[RatingItem]) -> ReplyKeyboardMarkup:
+    subjects = sorted({item.subject for item in items})
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=subject)] for subject in subjects],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
 def _schedule_day_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -185,12 +200,12 @@ def _is_known_schedule_day(value: str | None) -> bool:
 
 def _welcome_caption() -> str:
     return (
-        "Привет! Я бот РЭУ для быстрого доступа к учебной информации.\n\n"
-        "Что умею:\n"
-        "1. Показывать ваши баллы по предметам.\n"
-        "2. Показывать расписание пар на текущую неделю.\n"
-        "3. Присылать уведомления об изменениях баллов или расписания при ближайшей проверке, обычно в течение часа.\n\n"
-        "Для работы нужен логин и пароль от ЛКС РЭУ. Данные хранятся в зашифрованном виде."
+        "РЭУ в кармане.\n\n"
+        "Больше не нужно каждый раз заходить в ЛКС и искать нужную вкладку. "
+        "Бот быстро покажет ваши баллы по предметам, расписание пар на текущую неделю "
+        "и сам предупредит, если в рейтинге или расписании что-то изменится.\n\n"
+        "Нажмите Старт, выберите действие и получите актуальные данные за несколько секунд. "
+        "Логин и пароль нужны один раз и хранятся в зашифрованном виде."
     )
 
 
@@ -325,6 +340,12 @@ async def logout(message: Message, state: FSMContext) -> None:
 async def schedule_command(message: Message, state: FSMContext) -> None:
     logging.info("Received /schedule from user_id=%s", _telegram_user_id(message))
     await start_schedule_flow(message, state)
+
+
+@router.message(Command("rating"))
+async def rating_command(message: Message, state: FSMContext) -> None:
+    logging.info("Received /rating from user_id=%s", _telegram_user_id(message))
+    await start_rating_flow(message, state)
 
 
 @router.message(Command("schedule_reset"))
@@ -472,9 +493,7 @@ async def handle_password(message: Message, state: FSMContext) -> None:
 
     if pending_action == "rating":
         await state.update_data(pending_action=None)
-        await state.set_state(RatingStates.waiting_for_subject)
-        response = "Готово. Теперь напишите предмет, например: матан, англ, алгоритмы."
-        await message.answer(response)
+        await ask_subject_from_items(message, state, items, prefix="Готово. Данные входа сохранены.")
         return
 
     await state.update_data(pending_action=None)
@@ -569,9 +588,9 @@ async def handle_schedule_day(message: Message, state: FSMContext) -> None:
     for index, response_part in enumerate(split_telegram_text(response)):
         await message.answer(
             response_part,
-            reply_markup=ReplyKeyboardRemove() if index == 0 else None,
+            reply_markup=_action_keyboard() if index == 0 else None,
         )
-    await state.set_state(RatingStates.waiting_for_subject)
+    await state.set_state(RatingStates.waiting_for_action)
 
 
 @router.message(RatingStates.waiting_for_subject, F.text)
@@ -648,6 +667,34 @@ async def show_action_menu(message: Message, state: FSMContext) -> None:
     await message.answer(response, reply_markup=_action_keyboard())
 
 
+async def ask_subject_from_items(
+    message: Message,
+    state: FSMContext,
+    items: list[RatingItem],
+    *,
+    prefix: str | None = None,
+) -> None:
+    await state.set_state(RatingStates.waiting_for_subject)
+    response = "Выберите предмет:"
+    if prefix:
+        response = f"{prefix}\n{response}"
+    await _log_event(message, "rating_start", result_status="subject_requested", response_text=response)
+    await message.answer(response, reply_markup=_subject_keyboard(items))
+
+
+async def fetch_rating_items(credentials) -> list[RatingItem]:
+    html = await asyncio.to_thread(
+        RatingClient(login=credentials.login, password=credentials.password).fetch_html
+    )
+    return parse_rating_html(
+        html,
+        table_selector=os.getenv("RATING_TABLE_SELECTOR") or None,
+        table_index=_env_int("RATING_TABLE_INDEX"),
+        subject_column_index=_env_int("SUBJECT_COLUMN_INDEX"),
+        score_column_index=_env_int("SCORE_COLUMN_INDEX"),
+    )
+
+
 async def start_rating_flow(message: Message, state: FSMContext) -> None:
     if not await _is_allowed(message):
         response = "Доступ запрещен."
@@ -671,10 +718,22 @@ async def start_rating_flow(message: Message, state: FSMContext) -> None:
         await message.answer(response, reply_markup=ReplyKeyboardRemove())
         return
 
-    await state.set_state(RatingStates.waiting_for_subject)
-    response = "Баллы по какому предмету вас интересуют?"
-    await _log_event(message, "rating_start", result_status="subject_requested", response_text=response)
-    await message.answer(response, reply_markup=ReplyKeyboardRemove())
+    try:
+        items = await fetch_rating_items(credentials)
+    except (RatingFetchError, RatingParseError) as exc:
+        response = f"Не удалось получить список предметов: {exc}"
+        await _log_event(
+            message,
+            "rating_start",
+            result_status="fetch_failed",
+            response_text=response,
+            error_message=str(exc),
+        )
+        await message.answer(response, reply_markup=_action_keyboard())
+        await state.set_state(RatingStates.waiting_for_action)
+        return
+
+    await ask_subject_from_items(message, state, items)
 
 
 async def answer_subject(message: Message) -> None:
@@ -743,7 +802,7 @@ async def answer_subject(message: Message) -> None:
             result_status="not_found",
             response_text=response,
         )
-        await message.answer(response)
+        await message.answer(response, reply_markup=_subject_keyboard(items))
         return
 
     response = format_rating_item(item)
@@ -756,7 +815,7 @@ async def answer_subject(message: Message) -> None:
         result_status="found",
         response_text=response,
     )
-    await message.answer(response)
+    await message.answer(response, reply_markup=_subject_keyboard(items))
 
 
 def format_rating_item(item: RatingItem) -> str:
@@ -1190,12 +1249,25 @@ def _log_manual_monitor_task_result(task: asyncio.Task) -> None:
 
 async def on_webhook_startup(bot: Bot, dispatcher: Dispatcher) -> None:
     webhook_url = build_webhook_url()
+    await configure_bot_profile(bot)
     await bot.set_webhook(
         webhook_url,
         secret_token=get_webhook_secret(),
         allowed_updates=dispatcher.resolve_used_update_types(),
     )
     logging.info("Webhook set to %s", webhook_url)
+
+
+async def configure_bot_profile(bot: Bot) -> None:
+    commands = [
+        BotCommand(command="rating", description="Просмотр баллов"),
+        BotCommand(command="schedule", description="Расписание пар"),
+    ]
+    await bot.set_my_commands(commands)
+    with contextlib.suppress(Exception):
+        await bot.set_my_description(BOT_DESCRIPTION)
+    with contextlib.suppress(Exception):
+        await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
 
 
 async def start_monitor_task(app: web.Application) -> None:
@@ -1242,6 +1314,7 @@ async def run_polling() -> None:
     store = UserStore()
     bot = Bot(token=get_bot_token())
     dispatcher = create_dispatcher()
+    await configure_bot_profile(bot)
     await bot.delete_webhook(drop_pending_updates=False)
     try:
         await dispatcher.start_polling(bot)

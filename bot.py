@@ -21,11 +21,9 @@ from dotenv import load_dotenv
 
 from rating_client import RatingClient, RatingFetchError, create_rea_session
 from rating_parser import (
-    SUBJECT_ALIASES,
     RatingItem,
     RatingParseError,
     find_subject_score,
-    normalize_text,
     parse_rating_html,
 )
 from schedule_client import ScheduleClient, ScheduleFetchError
@@ -70,14 +68,16 @@ SCHEDULE_ACTION_TEXT = "Расписание пар"
 BACK_BUTTON_TEXT = "Назад"
 DELETE_DATA_TEXT = "Удалить данные"
 CONFIRM_DELETE_TEXT = "Да, удалить"
-NOTIFICATIONS_ON_TEXT = "Уведомления: включены"
-NOTIFICATIONS_OFF_TEXT = "Уведомления: выключены"
+NOTIFICATIONS_ENABLE_TEXT = "Включить уведомления об изменениях"
+NOTIFICATIONS_DISABLE_TEXT = "Выключить уведомления об изменениях"
 NOTIFICATION_TRIGGER_TEXTS = {
     "уведомления",
     "включить уведомления",
     "выключить уведомления",
-    NOTIFICATIONS_ON_TEXT.casefold(),
-    NOTIFICATIONS_OFF_TEXT.casefold(),
+    "уведомления: включены",
+    "уведомления: выключены",
+    NOTIFICATIONS_ENABLE_TEXT.casefold(),
+    NOTIFICATIONS_DISABLE_TEXT.casefold(),
 }
 SCHEDULE_DAY_BUTTONS = (
     "Понедельник",
@@ -200,13 +200,13 @@ def _start_keyboard() -> ReplyKeyboardMarkup:
 
 
 def _action_keyboard(telegram_user_id: int | None = None) -> ReplyKeyboardMarkup:
-    notifications_text = NOTIFICATIONS_ON_TEXT
+    notifications_text = NOTIFICATIONS_DISABLE_TEXT
     if telegram_user_id is not None:
         try:
             notifications_text = (
-                NOTIFICATIONS_ON_TEXT
+                NOTIFICATIONS_DISABLE_TEXT
                 if _store().notifications_enabled(telegram_user_id)
-                else NOTIFICATIONS_OFF_TEXT
+                else NOTIFICATIONS_ENABLE_TEXT
             )
         except Exception:
             logging.exception("Could not read notification settings for user_id=%s", telegram_user_id)
@@ -223,9 +223,8 @@ def _action_keyboard(telegram_user_id: int | None = None) -> ReplyKeyboardMarkup
 
 
 def _subject_keyboard(items: list[RatingItem]) -> ReplyKeyboardMarkup:
-    subjects = sorted({item.subject for item in items}, key=lambda value: _subject_button_text(value))
-    buttons = [KeyboardButton(text=_subject_button_text(subject)) for subject in subjects]
-    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    subjects = sorted({item.subject for item in items})
+    rows = [[KeyboardButton(text=subject)] for subject in subjects]
     rows.append([KeyboardButton(text=BACK_BUTTON_TEXT)])
     return ReplyKeyboardMarkup(
         keyboard=rows,
@@ -267,14 +266,6 @@ def _back_keyboard() -> ReplyKeyboardMarkup:
 def _is_known_schedule_day(value: str | None) -> bool:
     normalized = _normalize_message_text(value)
     return normalized in {_normalize_message_text(day) for day in SCHEDULE_DAY_BUTTONS}
-
-
-def _subject_button_text(subject: str) -> str:
-    normalized_subject = normalize_text(subject)
-    for alias, full_name in SUBJECT_ALIASES.items():
-        if normalize_text(full_name) == normalized_subject:
-            return alias
-    return subject
 
 
 def _welcome_caption() -> str:

@@ -51,7 +51,7 @@ def parse_schedule_html(html: str) -> ScheduleWeek:
     soup = BeautifulSoup(html, "html.parser")
     if soup.select_one("table.table_lessons") is not None:
         return parse_student_lessons_html(soup)
-    return parse_rasp_lessons_html(soup)
+    raise ScheduleParseError("Не найдена таблица расписания ЛКС.")
 
 
 def parse_student_lessons_html(soup: BeautifulSoup) -> ScheduleWeek:
@@ -105,71 +105,6 @@ def parse_student_lessons_html(soup: BeautifulSoup) -> ScheduleWeek:
         group_name=group_name,
         updated_at=updated_at,
     )
-
-
-def parse_rasp_lessons_html(soup: BeautifulSoup) -> ScheduleWeek:
-    week_num = _parse_week_num(soup)
-    days: list[ScheduleDay] = []
-
-    for table in soup.select("table"):
-        header = table.select_one(".dayh h5") or table.select_one(".dayh")
-        if header is None:
-            continue
-
-        title = _clean_text(header.get_text(" ", strip=True))
-        weekday, date_value = _split_day_title(title)
-        lessons: list[ScheduleLesson] = []
-
-        for row in table.select("tr.slot"):
-            row_classes = set(row.get("class") or [])
-            if "load-empty" in row_classes:
-                continue
-            if "Занятия отсутствуют" in row.get_text(" ", strip=True):
-                continue
-
-            cells = row.find_all("td", recursive=False)
-            if len(cells) < 2:
-                continue
-
-            pair, start_time, end_time = _parse_time_cell(cells[0])
-            task_nodes = cells[1].select("a.task")
-            if not task_nodes:
-                fallback_lesson = _parse_task_text(cells[1].get_text("\n", strip=True))
-                if fallback_lesson is not None:
-                    lessons.append(
-                        ScheduleLesson(
-                            pair=pair,
-                            start_time=start_time,
-                            end_time=end_time,
-                            subject=fallback_lesson[0],
-                            lesson_type=fallback_lesson[1],
-                            place=fallback_lesson[2],
-                        )
-                    )
-                continue
-
-            for task_node in task_nodes:
-                parsed = _parse_task_text(task_node.get_text("\n", strip=True))
-                if parsed is None:
-                    continue
-                subject, lesson_type, place = parsed
-                lessons.append(
-                    ScheduleLesson(
-                        pair=pair,
-                        start_time=start_time,
-                        end_time=end_time,
-                        subject=subject,
-                        lesson_type=lesson_type,
-                        place=place,
-                    )
-                )
-
-        days.append(ScheduleDay(title=title, weekday=weekday, date=date_value, lessons=lessons))
-
-    if not days:
-        raise ScheduleParseError("Не удалось разобрать расписание из ответа сайта.")
-
-    return ScheduleWeek(week_num=week_num, days=sort_suggested_days(days))
 
 
 def find_schedule_day(week: ScheduleWeek, day_query: str) -> ScheduleDay | None:
@@ -310,14 +245,6 @@ def _extract_label_value(text: str, label: str) -> str | None:
     return None
 
 
-def _parse_week_num(soup: BeautifulSoup) -> int | None:
-    week_input = soup.select_one("#weekNum")
-    if week_input is None:
-        return None
-    value = str(week_input.get("value") or "").strip()
-    return int(value) if value.isdigit() else None
-
-
 def _split_day_title(title: str) -> tuple[str, str | None]:
     if "," not in title:
         return title, None
@@ -346,17 +273,6 @@ def _parse_time_cell(cell) -> tuple[str, str | None, str | None]:
             start_time = time_value
             end_time = lines[2] if len(lines) > 2 else None
     return pair, start_time, end_time
-
-
-def _parse_task_text(raw_text: str) -> tuple[str, str | None, str | None] | None:
-    lines = _split_lines(raw_text)
-    if not lines:
-        return None
-
-    subject = lines[0]
-    lesson_type = lines[1] if len(lines) > 1 else None
-    place = _clean_place(" ".join(lines[2:])) if len(lines) > 2 else None
-    return subject, lesson_type, place
 
 
 def _format_lesson_time(lesson: ScheduleLesson) -> str:

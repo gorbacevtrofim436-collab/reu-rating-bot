@@ -36,14 +36,6 @@ class RatingSnapshot:
 
 
 @dataclass(frozen=True)
-class SchedulePreference:
-    telegram_user_id: int
-    schedule_key: str
-    schedule_name: str
-    schedule_metadata: str | None = None
-
-
-@dataclass(frozen=True)
 class ScheduleSnapshot:
     telegram_user_id: int
     schedule_hash: str
@@ -144,11 +136,9 @@ class UserStore:
                     )
                     cursor.execute(
                         """
-                        CREATE TABLE IF NOT EXISTS schedule_preferences (
+                        CREATE TABLE IF NOT EXISTS user_settings (
                             telegram_user_id BIGINT PRIMARY KEY,
-                            schedule_key TEXT NOT NULL,
-                            schedule_name TEXT NOT NULL,
-                            schedule_metadata TEXT,
+                            notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                             created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                             updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                         )
@@ -229,11 +219,9 @@ class UserStore:
             )
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS schedule_preferences (
+                CREATE TABLE IF NOT EXISTS user_settings (
                     telegram_user_id INTEGER PRIMARY KEY,
-                    schedule_key TEXT NOT NULL,
-                    schedule_name TEXT NOT NULL,
-                    schedule_metadata TEXT,
+                    notifications_enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -401,6 +389,122 @@ class UserStore:
 
         return credentials
 
+    def list_notification_credentials(self) -> list[StoredCredentials]:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT c.telegram_user_id, c.rea_login, c.rea_password_encrypted
+                        FROM rea_credentials AS c
+                        LEFT JOIN user_settings AS s
+                          ON s.telegram_user_id = c.telegram_user_id
+                        WHERE COALESCE(s.notifications_enabled, TRUE) = TRUE
+                        ORDER BY c.updated_at ASC
+                        """
+                    )
+                    rows = cursor.fetchall()
+        else:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT c.telegram_user_id, c.rea_login, c.rea_password_encrypted
+                    FROM rea_credentials AS c
+                    LEFT JOIN user_settings AS s
+                      ON s.telegram_user_id = c.telegram_user_id
+                    WHERE COALESCE(s.notifications_enabled, 1) = 1
+                    ORDER BY c.updated_at ASC
+                    """
+                ).fetchall()
+
+        credentials: list[StoredCredentials] = []
+        invalid_user_ids: list[int] = []
+        for telegram_user_id, login, encrypted_password in rows:
+            try:
+                password = self.cipher.decrypt(bytes(encrypted_password)).decode("utf-8")
+            except InvalidToken:
+                invalid_user_ids.append(int(telegram_user_id))
+                continue
+            credentials.append(
+                StoredCredentials(
+                    telegram_user_id=int(telegram_user_id),
+                    login=login,
+                    password=password,
+                )
+            )
+
+        for telegram_user_id in invalid_user_ids:
+            self.delete_credentials(telegram_user_id)
+
+        return credentials
+
+    def notifications_enabled(self, telegram_user_id: int) -> bool:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT notifications_enabled
+                        FROM user_settings
+                        WHERE telegram_user_id = %s
+                        """,
+                        (telegram_user_id,),
+                    )
+                    row = cursor.fetchone()
+        else:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT notifications_enabled
+                    FROM user_settings
+                    WHERE telegram_user_id = ?
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+
+        if row is None:
+            return True
+        return bool(row[0])
+
+    def set_notifications_enabled(self, telegram_user_id: int, enabled: bool) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO user_settings (
+                            telegram_user_id,
+                            notifications_enabled
+                        )
+                        VALUES (%s, %s)
+                        ON CONFLICT(telegram_user_id) DO UPDATE SET
+                            notifications_enabled = EXCLUDED.notifications_enabled,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (telegram_user_id, enabled),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_settings (
+                    telegram_user_id,
+                    notifications_enabled
+                )
+                VALUES (?, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    notifications_enabled = excluded.notifications_enabled,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (telegram_user_id, int(enabled)),
+            )
+
+    def toggle_notifications_enabled(self, telegram_user_id: int) -> bool:
+        enabled = not self.notifications_enabled(telegram_user_id)
+        self.set_notifications_enabled(telegram_user_id, enabled)
+        return enabled
+
     def get_rating_snapshots(self, telegram_user_id: int) -> dict[str, RatingSnapshot]:
         if self.use_postgres:
             with self._pg_connect() as connection:
@@ -551,105 +655,6 @@ class UserStore:
                 (telegram_user_id, rea_login, encrypted_password),
             )
 
-    def get_schedule_preference(self, telegram_user_id: int) -> SchedulePreference | None:
-        if self.use_postgres:
-            with self._pg_connect() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT schedule_key, schedule_name, schedule_metadata
-                        FROM schedule_preferences
-                        WHERE telegram_user_id = %s
-                        """,
-                        (telegram_user_id,),
-                    )
-                    row = cursor.fetchone()
-        else:
-            with self._connect() as connection:
-                row = connection.execute(
-                    """
-                    SELECT schedule_key, schedule_name, schedule_metadata
-                    FROM schedule_preferences
-                    WHERE telegram_user_id = ?
-                    """,
-                    (telegram_user_id,),
-                ).fetchone()
-
-        if row is None:
-            return None
-
-        return SchedulePreference(
-            telegram_user_id=telegram_user_id,
-            schedule_key=row[0],
-            schedule_name=row[1],
-            schedule_metadata=row[2],
-        )
-
-    def save_schedule_preference(
-        self,
-        *,
-        telegram_user_id: int,
-        schedule_key: str,
-        schedule_name: str,
-        schedule_metadata: str | None = None,
-    ) -> None:
-        if self.use_postgres:
-            with self._pg_connect() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        INSERT INTO schedule_preferences (
-                            telegram_user_id,
-                            schedule_key,
-                            schedule_name,
-                            schedule_metadata
-                        )
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT(telegram_user_id) DO UPDATE SET
-                            schedule_key = EXCLUDED.schedule_key,
-                            schedule_name = EXCLUDED.schedule_name,
-                            schedule_metadata = EXCLUDED.schedule_metadata,
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        (telegram_user_id, schedule_key, schedule_name, schedule_metadata),
-                    )
-            return
-
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO schedule_preferences (
-                    telegram_user_id,
-                    schedule_key,
-                    schedule_name,
-                    schedule_metadata
-                )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(telegram_user_id) DO UPDATE SET
-                    schedule_key = excluded.schedule_key,
-                    schedule_name = excluded.schedule_name,
-                    schedule_metadata = excluded.schedule_metadata,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (telegram_user_id, schedule_key, schedule_name, schedule_metadata),
-            )
-
-    def delete_schedule_preference(self, telegram_user_id: int) -> None:
-        if self.use_postgres:
-            with self._pg_connect() as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "DELETE FROM schedule_preferences WHERE telegram_user_id = %s",
-                        (telegram_user_id,),
-                    )
-            return
-
-        with self._connect() as connection:
-            connection.execute(
-                "DELETE FROM schedule_preferences WHERE telegram_user_id = ?",
-                (telegram_user_id,),
-            )
-
     def get_schedule_snapshot(self, telegram_user_id: int) -> ScheduleSnapshot | None:
         if self.use_postgres:
             with self._pg_connect() as connection:
@@ -740,11 +745,11 @@ class UserStore:
                         (telegram_user_id,),
                     )
                     cursor.execute(
-                        "DELETE FROM schedule_preferences WHERE telegram_user_id = %s",
+                        "DELETE FROM schedule_snapshots WHERE telegram_user_id = %s",
                         (telegram_user_id,),
                     )
                     cursor.execute(
-                        "DELETE FROM schedule_snapshots WHERE telegram_user_id = %s",
+                        "DELETE FROM user_settings WHERE telegram_user_id = %s",
                         (telegram_user_id,),
                     )
             return
@@ -759,11 +764,11 @@ class UserStore:
                 (telegram_user_id,),
             )
             connection.execute(
-                "DELETE FROM schedule_preferences WHERE telegram_user_id = ?",
+                "DELETE FROM schedule_snapshots WHERE telegram_user_id = ?",
                 (telegram_user_id,),
             )
             connection.execute(
-                "DELETE FROM schedule_snapshots WHERE telegram_user_id = ?",
+                "DELETE FROM user_settings WHERE telegram_user_id = ?",
                 (telegram_user_id,),
             )
 

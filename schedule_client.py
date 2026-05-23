@@ -4,7 +4,7 @@ import os
 
 import requests
 
-from rating_client import RatingClient
+from rating_client import RatingClient, create_rea_session
 
 
 class ScheduleFetchError(RuntimeError):
@@ -20,21 +20,18 @@ class ScheduleClient:
         cookie_header: str | None = None,
     ) -> None:
         self.url = os.getenv("REA_LESSONS_URL", "https://student.rea.ru/lessons/index.php?login=yes")
+        has_explicit_credentials = login is not None or password is not None
         self.login = (login if login is not None else os.getenv("REA_LOGIN", "")).strip()
         self.password = (password if password is not None else os.getenv("REA_PASSWORD", "")).strip()
-        self.cookie_header = (cookie_header if cookie_header is not None else os.getenv("REA_COOKIE_HEADER", "")).strip()
+        self.cookie_header = (
+            cookie_header
+            if cookie_header is not None
+            else "" if has_explicit_credentials else os.getenv("REA_COOKIE_HEADER", "")
+        ).strip()
         self.timeout = float(os.getenv("REA_SCHEDULE_REQUEST_TIMEOUT", os.getenv("REA_REQUEST_TIMEOUT", "15")))
 
     def fetch_week_html(self) -> str:
-        session = requests.Session()
-        session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-                )
-            }
-        )
+        session = create_rea_session()
 
         try:
             if self.cookie_header:
@@ -51,14 +48,20 @@ class ScheduleClient:
 
             rating_client = RatingClient(login=self.login, password=self.password)
             rating_client._login(session)
-            response = session.get(self.url, timeout=self.timeout)
-            response.raise_for_status()
+            return self.fetch_week_html_from_session(session)
         except requests.RequestException as exc:
             raise ScheduleFetchError("Сайт РЭУ временно не отвечает. Попробуйте позже.") from exc
         except Exception as exc:
             if isinstance(exc, ScheduleFetchError):
                 raise
             raise ScheduleFetchError(str(exc)) from exc
+
+    def fetch_week_html_from_session(self, session: requests.Session) -> str:
+        try:
+            response = session.get(self.url, timeout=self.timeout)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise ScheduleFetchError("Сайт РЭУ временно не отвечает. Попробуйте позже.") from exc
 
         if not self._is_authorized_lessons_page(response.text):
             raise ScheduleFetchError("Авторизация прошла, но страница расписания не содержит данных.")

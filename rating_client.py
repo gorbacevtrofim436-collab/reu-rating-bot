@@ -11,6 +11,18 @@ class RatingFetchError(RuntimeError):
     pass
 
 
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
+
+
+def create_rea_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+
 class RatingClient:
     def __init__(
         self,
@@ -35,15 +47,7 @@ class RatingClient:
         self.timeout = float(os.getenv("REA_REQUEST_TIMEOUT", "15"))
 
     def fetch_html(self) -> str:
-        session = requests.Session()
-        session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-                )
-            }
-        )
+        session = create_rea_session()
 
         try:
             if self.cookie_header:
@@ -61,6 +65,12 @@ class RatingClient:
                 )
 
             self._login(session)
+            return self.fetch_html_from_session(session)
+        except requests.RequestException as exc:
+            raise RatingFetchError("Сайт РЭУ временно не отвечает. Попробуйте позже.") from exc
+
+    def fetch_html_from_session(self, session: requests.Session) -> str:
+        try:
             response = session.get(self.url, timeout=self.timeout)
             self._raise_for_status(response)
         except requests.RequestException as exc:
@@ -72,33 +82,36 @@ class RatingClient:
         return response.text
 
     def _login(self, session: requests.Session) -> None:
-        response = session.get(self.login_url, timeout=self.timeout)
-        self._raise_for_status(response)
+        try:
+            response = session.get(self.login_url, timeout=self.timeout)
+            self._raise_for_status(response)
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        form = soup.find("form", {"name": "form_auth"}) or soup.find("form")
-        if form is None:
-            raise RatingFetchError("Не найдена форма входа на сайте РЭУ.")
+            soup = BeautifulSoup(response.text, "html.parser")
+            form = soup.find("form", {"name": "form_auth"}) or soup.find("form")
+            if form is None:
+                raise RatingFetchError("Не найдена форма входа на сайте РЭУ.")
 
-        post_url = urljoin(response.url, form.get("action") or "/index.php?login=yes")
-        data: dict[str, str] = {}
-        for input_node in form.find_all("input"):
-            name = input_node.get("name")
-            if not name:
-                continue
-            data[name] = input_node.get("value") or ""
+            post_url = urljoin(response.url, form.get("action") or "/index.php?login=yes")
+            data: dict[str, str] = {}
+            for input_node in form.find_all("input"):
+                name = input_node.get("name")
+                if not name:
+                    continue
+                data[name] = input_node.get("value") or ""
 
-        data["USER_LOGIN"] = self.login
-        data["USER_PASSWORD"] = self.password
-        data.setdefault("Login", "Войти")
+            data["USER_LOGIN"] = self.login
+            data["USER_PASSWORD"] = self.password
+            data.setdefault("Login", "Войти")
 
-        login_response = session.post(
-            post_url,
-            data=data,
-            timeout=self.timeout,
-            allow_redirects=True,
-        )
-        self._raise_for_status(login_response)
+            login_response = session.post(
+                post_url,
+                data=data,
+                timeout=self.timeout,
+                allow_redirects=True,
+            )
+            self._raise_for_status(login_response)
+        except requests.RequestException as exc:
+            raise RatingFetchError("Сайт РЭУ временно не отвечает. Попробуйте позже.") from exc
 
         if self._looks_like_login_page(login_response.text):
             raise RatingFetchError("Сайт не принял логин или пароль.")

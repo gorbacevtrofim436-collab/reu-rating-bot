@@ -1479,6 +1479,22 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
             )
             return
 
+        if previous.schedule_key is None and previous.schedule_hash == current_hash:
+            await asyncio.to_thread(
+                _store().save_schedule_snapshot,
+                telegram_user_id=telegram_user_id,
+                schedule_key=current_key,
+                schedule_hash=current_hash,
+                schedule_text=current_text,
+            )
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="schedule_monitor",
+                result_status="week_key_backfilled",
+                response_text=f"lessons={len(current_text.splitlines())}",
+            )
+            return
+
         if previous.schedule_hash == current_hash:
             await _log_store_event(
                 telegram_user_id=telegram_user_id,

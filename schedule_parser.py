@@ -162,6 +162,15 @@ def schedule_snapshot_text(week: ScheduleWeek) -> str:
     return "\n".join(lines)
 
 
+def schedule_week_key(week: ScheduleWeek) -> str:
+    date_parts = [day.date for day in week.days if day.date]
+    if date_parts:
+        return "|".join(date_parts)
+    if week.week_num is not None:
+        return f"week:{week.week_num}"
+    return "|".join(day.title for day in week.days)
+
+
 def format_schedule_snapshot_line(day: ScheduleDay, lesson: ScheduleLesson) -> str:
     parts = [
         day.title.capitalize(),

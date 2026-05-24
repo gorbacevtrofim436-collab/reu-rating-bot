@@ -34,6 +34,7 @@ from schedule_parser import (
     format_schedule_week,
     parse_schedule_html,
     schedule_snapshot_text,
+    schedule_week_key,
 )
 from user_store import RatingSnapshot, StoredCredentials, UserStore, UserStoreError
 
@@ -636,12 +637,15 @@ async def handle_schedule_day(message: Message, state: FSMContext) -> None:
         )
         week = parse_schedule_html(html)
         current_schedule_text = schedule_snapshot_text(week)
-        await asyncio.to_thread(
-            _store().save_schedule_snapshot,
-            telegram_user_id=user_id,
-            schedule_hash=hashlib.sha256(current_schedule_text.encode("utf-8")).hexdigest(),
-            schedule_text=current_schedule_text,
-        )
+        previous_schedule_snapshot = await asyncio.to_thread(_store().get_schedule_snapshot, user_id)
+        if previous_schedule_snapshot is None:
+            await asyncio.to_thread(
+                _store().save_schedule_snapshot,
+                telegram_user_id=user_id,
+                schedule_key=schedule_week_key(week),
+                schedule_hash=hashlib.sha256(current_schedule_text.encode("utf-8")).hexdigest(),
+                schedule_text=current_schedule_text,
+            )
     except (ScheduleFetchError, ScheduleParseError) as exc:
         response = f"Не удалось получить расписание: {exc}"
         await _log_event(
@@ -1087,11 +1091,11 @@ def format_rating_change_notification(changes: dict[str, list[tuple[str, str, st
     return "\n".join(lines)
 
 
-def build_schedule_snapshot(html: str) -> tuple[str, str]:
+def build_schedule_snapshot(html: str):
     week = parse_schedule_html(html)
     text = schedule_snapshot_text(week)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return digest, text
+    return digest, text, schedule_week_key(week), week
 
 
 async def save_schedule_baseline_if_available(
@@ -1116,10 +1120,11 @@ async def save_schedule_baseline_if_available(
             if not login or not password:
                 raise ScheduleFetchError("Нет логина и пароля для сохранения снимка расписания.")
             html = await asyncio.to_thread(ScheduleClient(login=login, password=password).fetch_week_html)
-        schedule_hash, schedule_text = build_schedule_snapshot(html)
+        schedule_hash, schedule_text, schedule_key, _ = build_schedule_snapshot(html)
         await asyncio.to_thread(
             _store().save_schedule_snapshot,
             telegram_user_id=telegram_user_id,
+            schedule_key=schedule_key,
             schedule_hash=schedule_hash,
             schedule_text=schedule_text,
         )
@@ -1194,6 +1199,23 @@ def format_schedule_change_notification(previous_text: str, current_text: str) -
     if not added and not removed:
         lines.append("Структура расписания обновилась на сайте.")
     return "\n".join(lines)
+
+
+def format_new_week_schedule_notification(week) -> str:
+    return "Началась новая учебная неделя. Актуальное расписание:\n\n" + format_schedule_week(week)
+
+
+def infer_schedule_week_key_from_snapshot_text(schedule_text: str) -> str | None:
+    dates: list[str] = []
+    for line in schedule_text.splitlines():
+        day_part = line.split("|", 1)[0].strip()
+        if "," not in day_part:
+            continue
+        _, date_value = day_part.split(",", 1)
+        date_value = " ".join(date_value.split())
+        if date_value and date_value not in dates:
+            dates.append(date_value)
+    return "|".join(dates) if dates else None
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
@@ -1402,13 +1424,14 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
 
 async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: str) -> None:
     try:
-        current_hash, current_text = build_schedule_snapshot(html)
+        current_hash, current_text, current_key, current_week = build_schedule_snapshot(html)
         previous = await asyncio.to_thread(_store().get_schedule_snapshot, telegram_user_id)
 
         if previous is None:
             await asyncio.to_thread(
                 _store().save_schedule_snapshot,
                 telegram_user_id=telegram_user_id,
+                schedule_key=current_key,
                 schedule_hash=current_hash,
                 schedule_text=current_text,
             )
@@ -1417,6 +1440,42 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
                 event_type="schedule_monitor",
                 result_status="baseline_saved",
                 response_text=f"lessons={len(current_text.splitlines())}",
+            )
+            return
+
+        previous_key = previous.schedule_key or infer_schedule_week_key_from_snapshot_text(previous.schedule_text)
+        if previous_key is None:
+            await asyncio.to_thread(
+                _store().save_schedule_snapshot,
+                telegram_user_id=telegram_user_id,
+                schedule_key=current_key,
+                schedule_hash=current_hash,
+                schedule_text=current_text,
+            )
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="schedule_monitor",
+                result_status="week_key_backfilled",
+                response_text=f"lessons={len(current_text.splitlines())}",
+            )
+            return
+
+        if previous_key != current_key:
+            notification = format_new_week_schedule_notification(current_week)
+            for notification_part in split_telegram_text(notification):
+                await bot.send_message(chat_id=telegram_user_id, text=notification_part)
+            await asyncio.to_thread(
+                _store().save_schedule_snapshot,
+                telegram_user_id=telegram_user_id,
+                schedule_key=current_key,
+                schedule_hash=current_hash,
+                schedule_text=current_text,
+            )
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="schedule_week_change",
+                result_status="notified",
+                response_text=notification,
             )
             return
 
@@ -1435,6 +1494,7 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
         await asyncio.to_thread(
             _store().save_schedule_snapshot,
             telegram_user_id=telegram_user_id,
+            schedule_key=current_key,
             schedule_hash=current_hash,
             schedule_text=current_text,
         )

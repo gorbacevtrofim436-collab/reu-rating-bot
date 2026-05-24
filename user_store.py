@@ -40,6 +40,7 @@ class ScheduleSnapshot:
     telegram_user_id: int
     schedule_hash: str
     schedule_text: str
+    schedule_key: str | None = None
 
 
 class UserStore:
@@ -148,10 +149,17 @@ class UserStore:
                         """
                         CREATE TABLE IF NOT EXISTS schedule_snapshots (
                             telegram_user_id BIGINT PRIMARY KEY,
+                            schedule_key TEXT,
                             schedule_hash TEXT NOT NULL,
                             schedule_text TEXT NOT NULL,
                             updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                         )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        ALTER TABLE schedule_snapshots
+                        ADD COLUMN IF NOT EXISTS schedule_key TEXT
                         """
                     )
             return
@@ -231,12 +239,19 @@ class UserStore:
                 """
                 CREATE TABLE IF NOT EXISTS schedule_snapshots (
                     telegram_user_id INTEGER PRIMARY KEY,
+                    schedule_key TEXT,
                     schedule_hash TEXT NOT NULL,
                     schedule_text TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(schedule_snapshots)").fetchall()
+            }
+            if "schedule_key" not in columns:
+                connection.execute("ALTER TABLE schedule_snapshots ADD COLUMN schedule_key TEXT")
 
     def log_event(
         self,
@@ -661,7 +676,7 @@ class UserStore:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
-                        SELECT schedule_hash, schedule_text
+                        SELECT schedule_hash, schedule_text, schedule_key
                         FROM schedule_snapshots
                         WHERE telegram_user_id = %s
                         """,
@@ -672,7 +687,7 @@ class UserStore:
             with self._connect() as connection:
                 row = connection.execute(
                     """
-                    SELECT schedule_hash, schedule_text
+                    SELECT schedule_hash, schedule_text, schedule_key
                     FROM schedule_snapshots
                     WHERE telegram_user_id = ?
                     """,
@@ -686,6 +701,7 @@ class UserStore:
             telegram_user_id=telegram_user_id,
             schedule_hash=row[0],
             schedule_text=row[1],
+            schedule_key=row[2],
         )
 
     def save_schedule_snapshot(
@@ -694,6 +710,7 @@ class UserStore:
         telegram_user_id: int,
         schedule_hash: str,
         schedule_text: str,
+        schedule_key: str | None = None,
     ) -> None:
         if self.use_postgres:
             with self._pg_connect() as connection:
@@ -702,16 +719,18 @@ class UserStore:
                         """
                         INSERT INTO schedule_snapshots (
                             telegram_user_id,
+                            schedule_key,
                             schedule_hash,
                             schedule_text
                         )
-                        VALUES (%s, %s, %s)
+                        VALUES (%s, %s, %s, %s)
                         ON CONFLICT(telegram_user_id) DO UPDATE SET
+                            schedule_key = EXCLUDED.schedule_key,
                             schedule_hash = EXCLUDED.schedule_hash,
                             schedule_text = EXCLUDED.schedule_text,
                             updated_at = CURRENT_TIMESTAMP
                         """,
-                        (telegram_user_id, schedule_hash, schedule_text),
+                        (telegram_user_id, schedule_key, schedule_hash, schedule_text),
                     )
             return
 
@@ -720,16 +739,18 @@ class UserStore:
                 """
                 INSERT INTO schedule_snapshots (
                     telegram_user_id,
+                    schedule_key,
                     schedule_hash,
                     schedule_text
                 )
-                VALUES (?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    schedule_key = excluded.schedule_key,
                     schedule_hash = excluded.schedule_hash,
                     schedule_text = excluded.schedule_text,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (telegram_user_id, schedule_hash, schedule_text),
+                (telegram_user_id, schedule_key, schedule_hash, schedule_text),
             )
 
     def delete_credentials(self, telegram_user_id: int) -> None:

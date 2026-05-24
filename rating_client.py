@@ -11,6 +11,10 @@ class RatingFetchError(RuntimeError):
     pass
 
 
+class ReaCaptchaRequired(RatingFetchError):
+    pass
+
+
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -86,10 +90,19 @@ class RatingClient:
             response = session.get(self.login_url, timeout=self.timeout)
             self._raise_for_status(response)
 
+            if self._looks_like_captcha_page(response.text):
+                raise ReaCaptchaRequired(
+                    "Сайт РЭУ временно включил антибот-проверку/CAPTCHA. "
+                    "Бот не может обходить CAPTCHA. Попробуйте позже или откройте ЛКС вручную."
+                )
+
             soup = BeautifulSoup(response.text, "html.parser")
-            form = soup.find("form", {"name": "form_auth"}) or soup.find("form")
+            form = self._find_login_form(soup)
             if form is None:
-                raise RatingFetchError("Не найдена форма входа на сайте РЭУ.")
+                raise RatingFetchError(
+                    "Не найдена форма входа USER_LOGIN/USER_PASSWORD на сайте РЭУ. "
+                    "Сайт мог изменить авторизацию или показать защитную страницу."
+                )
 
             post_url = urljoin(response.url, form.get("action") or "/index.php?login=yes")
             data: dict[str, str] = {}
@@ -116,6 +129,16 @@ class RatingClient:
         if self._looks_like_login_page(login_response.text):
             raise RatingFetchError("Сайт не принял логин или пароль.")
 
+    def _find_login_form(self, soup: BeautifulSoup):
+        for form in soup.find_all("form"):
+            input_names = {
+                str(input_node.get("name") or "")
+                for input_node in form.find_all("input")
+            }
+            if {"USER_LOGIN", "USER_PASSWORD"}.issubset(input_names):
+                return form
+        return None
+
     def _raise_for_status(self, response: requests.Response) -> None:
         if response.status_code == 401 or response.status_code == 403:
             raise RatingFetchError("Сессия недействительна или доступ запрещен.")
@@ -129,3 +152,11 @@ class RatingClient:
 
     def _is_authorized_rating_page(self, html: str) -> bool:
         return ".es-rating__line-parent" in html or "es-rating__line-parent" in html
+
+    def _looks_like_captcha_page(self, html: str) -> bool:
+        return (
+            'id="captchaForm"' in html
+            or 'name="pin"' in html
+            or "/json/check" in html
+            or "/captcha" in html
+        )

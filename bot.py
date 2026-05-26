@@ -52,6 +52,7 @@ class RatingStates(StatesGroup):
 
 
 store: UserStore | None = None
+rating_cache_refresh_tasks: dict[int, asyncio.Task] = {}
 
 RATING_FIELDS = (
     ("attendance", "Работа на занятиях"),
@@ -883,6 +884,69 @@ async def get_cached_rating_items(telegram_user_id: int) -> list[RatingItem]:
     return rating_snapshots_to_items(snapshots)
 
 
+def start_rating_cache_refresh(
+    *,
+    telegram_user_id: int,
+    credentials,
+    source: str,
+) -> None:
+    existing_task = rating_cache_refresh_tasks.get(telegram_user_id)
+    if existing_task is not None and not existing_task.done():
+        return
+
+    task = asyncio.create_task(
+        refresh_rating_cache(
+            telegram_user_id=telegram_user_id,
+            credentials=credentials,
+            source=source,
+        )
+    )
+    rating_cache_refresh_tasks[telegram_user_id] = task
+    task.add_done_callback(
+        lambda finished_task: _finish_rating_cache_refresh(
+            telegram_user_id,
+            finished_task,
+        )
+    )
+
+
+async def refresh_rating_cache(
+    *,
+    telegram_user_id: int,
+    credentials,
+    source: str,
+) -> None:
+    try:
+        items = await fetch_rating_items(credentials)
+        await save_rating_items_cache(telegram_user_id, items)
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="rating_cache_refresh",
+            result_status="success",
+            response_text=f"source={source} subjects={len(items)}",
+        )
+    except (RatingFetchError, RatingParseError) as exc:
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="rating_cache_refresh",
+            result_status="failed",
+            response_text=f"source={source}",
+            error_message=str(exc),
+        )
+
+
+def _finish_rating_cache_refresh(telegram_user_id: int, task: asyncio.Task) -> None:
+    if rating_cache_refresh_tasks.get(telegram_user_id) is task:
+        rating_cache_refresh_tasks.pop(telegram_user_id, None)
+
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logging.info("Rating cache refresh task was cancelled")
+    except Exception:
+        logging.exception("Rating cache refresh task failed")
+
+
 def rating_snapshots_to_items(snapshots: dict[str, RatingSnapshot]) -> list[RatingItem]:
     return [
         RatingItem(
@@ -952,27 +1016,20 @@ async def start_rating_flow(message: Message, state: FSMContext) -> None:
         await message.answer(response, reply_markup=_back_keyboard())
         return
 
+    cached_items = await get_cached_rating_items(user_id)
+    if cached_items:
+        start_rating_cache_refresh(
+            telegram_user_id=user_id,
+            credentials=credentials,
+            source="rating_start",
+        )
+        await ask_subject_from_items(message, state, cached_items)
+        return
+
     try:
         items = await fetch_rating_items(credentials)
         await save_rating_items_cache(user_id, items)
     except (RatingFetchError, RatingParseError) as exc:
-        cached_items = await get_cached_rating_items(user_id)
-        if cached_items:
-            response = (
-                "Сайт РЭУ сейчас не ответил. Показываю последние сохраненные данные.\n"
-                "Выберите предмет:"
-            )
-            await _log_event(
-                message,
-                "rating_start",
-                result_status="cache_used",
-                response_text=response,
-                error_message=str(exc),
-            )
-            await state.set_state(RatingStates.waiting_for_subject)
-            await message.answer(response, reply_markup=_subject_keyboard(cached_items))
-            return
-
         response = f"Не удалось получить список предметов: {exc}"
         await _log_event(
             message,
@@ -1016,33 +1073,49 @@ async def answer_subject(message: Message) -> None:
         await message.answer(response, reply_markup=_action_keyboard(user_id))
         return
 
-    client = RatingClient(login=credentials.login, password=credentials.password)
+    cached_items = await get_cached_rating_items(user_id)
+    if cached_items:
+        start_rating_cache_refresh(
+            telegram_user_id=user_id,
+            credentials=credentials,
+            source="subject_query",
+        )
 
-    try:
-        html = await asyncio.to_thread(client.fetch_html)
-        items = parse_rating_items_from_html(html)
-        await save_rating_items_cache(user_id, items)
-    except (RatingFetchError, RatingParseError) as exc:
-        cached_items = await get_cached_rating_items(user_id)
         cached_item = find_subject_score(cached_items, subject_query)
-        if cached_item is not None:
-            response = (
-                "Сайт РЭУ сейчас не ответил. Показываю последние сохраненные баллы.\n\n"
-                f"{format_rating_item(cached_item)}"
-            )
+        if cached_item is None:
+            available = ", ".join(sorted({entry.subject for entry in cached_items})[:10])
+            suffix = f"\nДоступные предметы: {available}" if available else ""
+            response = f"Предмет не найден.{suffix}"
             await _log_event(
                 message,
                 "subject_query",
                 message_text=subject_query,
                 subject_query=subject_query,
-                subject_matched=cached_item.subject,
-                result_status="cache_used",
+                result_status="not_found_cache",
                 response_text=response,
-                error_message=str(exc),
             )
             await message.answer(response, reply_markup=_subject_keyboard(cached_items))
             return
 
+        response = format_rating_item(cached_item)
+        await _log_event(
+            message,
+            "subject_query",
+            message_text=subject_query,
+            subject_query=subject_query,
+            subject_matched=cached_item.subject,
+            result_status="cache_hit",
+            response_text=response,
+        )
+        await message.answer(response, reply_markup=_subject_keyboard(cached_items))
+        return
+
+    client = RatingClient(login=credentials.login, password=credentials.password)
+    try:
+        html = await asyncio.to_thread(client.fetch_html)
+        items = parse_rating_items_from_html(html)
+        await save_rating_items_cache(user_id, items)
+    except (RatingFetchError, RatingParseError) as exc:
         response = f"Не удалось получить баллы: {exc}"
         await _log_event(
             message,

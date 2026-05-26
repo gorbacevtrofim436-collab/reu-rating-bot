@@ -870,6 +870,33 @@ async def fetch_rating_items(credentials) -> list[RatingItem]:
     return parse_rating_items_from_html(html)
 
 
+async def save_rating_items_cache(telegram_user_id: int, items: list[RatingItem]) -> None:
+    await asyncio.to_thread(
+        _store().replace_rating_snapshots,
+        telegram_user_id=telegram_user_id,
+        snapshots=rating_items_to_snapshots(items),
+    )
+
+
+async def get_cached_rating_items(telegram_user_id: int) -> list[RatingItem]:
+    snapshots = await asyncio.to_thread(_store().get_rating_snapshots, telegram_user_id)
+    return rating_snapshots_to_items(snapshots)
+
+
+def rating_snapshots_to_items(snapshots: dict[str, RatingSnapshot]) -> list[RatingItem]:
+    return [
+        RatingItem(
+            subject=snapshot.subject,
+            total=snapshot.total,
+            attendance=snapshot.attendance,
+            control=snapshot.control,
+            creative=snapshot.creative,
+            intermediate=snapshot.intermediate,
+        )
+        for snapshot in sorted(snapshots.values(), key=lambda snapshot: snapshot.subject)
+    ]
+
+
 def parse_rating_items_from_html(html: str) -> list[RatingItem]:
     return parse_rating_html(
         html,
@@ -927,7 +954,25 @@ async def start_rating_flow(message: Message, state: FSMContext) -> None:
 
     try:
         items = await fetch_rating_items(credentials)
+        await save_rating_items_cache(user_id, items)
     except (RatingFetchError, RatingParseError) as exc:
+        cached_items = await get_cached_rating_items(user_id)
+        if cached_items:
+            response = (
+                "Сайт РЭУ сейчас не ответил. Показываю последние сохраненные данные.\n"
+                "Выберите предмет:"
+            )
+            await _log_event(
+                message,
+                "rating_start",
+                result_status="cache_used",
+                response_text=response,
+                error_message=str(exc),
+            )
+            await state.set_state(RatingStates.waiting_for_subject)
+            await message.answer(response, reply_markup=_subject_keyboard(cached_items))
+            return
+
         response = f"Не удалось получить список предметов: {exc}"
         await _log_event(
             message,
@@ -976,7 +1021,28 @@ async def answer_subject(message: Message) -> None:
     try:
         html = await asyncio.to_thread(client.fetch_html)
         items = parse_rating_items_from_html(html)
+        await save_rating_items_cache(user_id, items)
     except (RatingFetchError, RatingParseError) as exc:
+        cached_items = await get_cached_rating_items(user_id)
+        cached_item = find_subject_score(cached_items, subject_query)
+        if cached_item is not None:
+            response = (
+                "Сайт РЭУ сейчас не ответил. Показываю последние сохраненные баллы.\n\n"
+                f"{format_rating_item(cached_item)}"
+            )
+            await _log_event(
+                message,
+                "subject_query",
+                message_text=subject_query,
+                subject_query=subject_query,
+                subject_matched=cached_item.subject,
+                result_status="cache_used",
+                response_text=response,
+                error_message=str(exc),
+            )
+            await message.answer(response, reply_markup=_subject_keyboard(cached_items))
+            return
+
         response = f"Не удалось получить баллы: {exc}"
         await _log_event(
             message,

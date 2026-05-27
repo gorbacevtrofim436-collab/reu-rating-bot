@@ -36,7 +36,7 @@ from schedule_parser import (
     schedule_snapshot_text,
     schedule_week_key,
 )
-from user_store import RatingSnapshot, StoredCredentials, UserStore, UserStoreError
+from user_store import RatingSnapshot, ScheduleSnapshot, StoredCredentials, UserStore, UserStoreError
 
 
 router = Router()
@@ -53,6 +53,11 @@ class RatingStates(StatesGroup):
 
 store: UserStore | None = None
 rating_cache_refresh_tasks: dict[int, asyncio.Task] = {}
+schedule_cache_refresh_tasks: dict[int, asyncio.Task] = {}
+notification_settings_cache: dict[int, bool] = {}
+credentials_cache: dict[int, StoredCredentials] = {}
+rating_items_cache: dict[int, list[RatingItem]] = {}
+schedule_snapshot_cache: dict[int, ScheduleSnapshot] = {}
 
 RATING_FIELDS = (
     ("attendance", "Работа на занятиях"),
@@ -145,6 +150,43 @@ def _store() -> UserStore:
     return store
 
 
+def _warm_runtime_caches() -> None:
+    credentials_cache.clear()
+    rating_items_cache.clear()
+    schedule_snapshot_cache.clear()
+    notification_settings_cache.clear()
+
+    credentials_cache.update(
+        {
+            credentials.telegram_user_id: credentials
+            for credentials in _store().list_credentials()
+        }
+    )
+    rating_items_cache.update(
+        {
+            telegram_user_id: rating_snapshots_to_items(snapshots)
+            for telegram_user_id, snapshots in _store().list_rating_snapshots().items()
+        }
+    )
+    schedule_snapshot_cache.update(_store().list_schedule_snapshots())
+    notification_settings_cache.update(_store().list_notification_settings())
+
+
+def _get_credentials(telegram_user_id: int):
+    credentials = credentials_cache.get(telegram_user_id)
+    if credentials is not None:
+        return credentials
+
+    credentials = _store().get_credentials(telegram_user_id)
+    if credentials is not None:
+        credentials_cache[telegram_user_id] = StoredCredentials(
+            telegram_user_id=telegram_user_id,
+            login=credentials.login,
+            password=credentials.password,
+        )
+    return credentials
+
+
 def _telegram_user_id(message: Message) -> int | None:
     return message.from_user.id if message.from_user else None
 
@@ -204,14 +246,12 @@ def _start_keyboard() -> ReplyKeyboardMarkup:
 def _action_keyboard(telegram_user_id: int | None = None) -> ReplyKeyboardMarkup:
     notifications_text = NOTIFICATIONS_DISABLE_TEXT
     if telegram_user_id is not None:
-        try:
-            notifications_text = (
-                NOTIFICATIONS_DISABLE_TEXT
-                if _store().notifications_enabled(telegram_user_id)
-                else NOTIFICATIONS_ENABLE_TEXT
-            )
-        except Exception:
-            logging.exception("Could not read notification settings for user_id=%s", telegram_user_id)
+        notifications_enabled = notification_settings_cache.get(telegram_user_id, True)
+        notifications_text = (
+            NOTIFICATIONS_DISABLE_TEXT
+            if notifications_enabled
+            else NOTIFICATIONS_ENABLE_TEXT
+        )
 
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -299,10 +339,10 @@ async def _log_event(
     response_text: str | None = None,
     error_message: str | None = None,
 ) -> None:
-    try:
-        await asyncio.to_thread(
-            _store().log_event,
-            telegram_user_id=_telegram_user_id(message),
+    telegram_user_id = _telegram_user_id(message)
+    asyncio.create_task(
+        _log_store_event(
+            telegram_user_id=telegram_user_id,
             event_type=event_type,
             message_text=message_text,
             subject_query=subject_query,
@@ -311,8 +351,7 @@ async def _log_event(
             response_text=response_text,
             error_message=error_message,
         )
-    except Exception:
-        logging.exception("Could not write bot event for user_id=%s", _telegram_user_id(message))
+    )
 
 
 async def _log_store_event(
@@ -342,6 +381,13 @@ async def _log_store_event(
         logging.exception("Could not write bot event for user_id=%s", telegram_user_id)
 
 
+async def _save_notification_setting(telegram_user_id: int, enabled: bool) -> None:
+    try:
+        await asyncio.to_thread(_store().set_notifications_enabled, telegram_user_id, enabled)
+    except Exception:
+        logging.exception("Could not save notification setting for user_id=%s", telegram_user_id)
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     logging.info("Received /start from user_id=%s", message.from_user.id if message.from_user else None)
@@ -359,7 +405,7 @@ async def start(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    credentials = _store().get_credentials(user_id)
+    credentials = _get_credentials(user_id)
     if credentials is not None:
         await _log_event(message, "command", message_text="/start", result_status="menu_for_existing_user")
         await show_action_menu(message, state, prefix="С возвращением.")
@@ -406,7 +452,11 @@ async def logout(message: Message, state: FSMContext) -> None:
 
     user_id = _telegram_user_id(message)
     if user_id is not None:
-        _store().delete_credentials(user_id)
+        await asyncio.to_thread(_store().delete_credentials, user_id)
+        notification_settings_cache.pop(user_id, None)
+        credentials_cache.pop(user_id, None)
+        rating_items_cache.pop(user_id, None)
+        schedule_snapshot_cache.pop(user_id, None)
     await state.clear()
     response = "Данные входа и сохраненные снимки удалены."
     await _log_event(message, "command", message_text="/logout", result_status="credentials_deleted", response_text=response)
@@ -553,16 +603,18 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         await message.answer(response)
         return
 
-    _store().save_credentials(
+    await asyncio.to_thread(
+        _store().save_credentials,
         telegram_user_id=user_id,
         rea_login=login_value,
         rea_password=password_value,
     )
-    await asyncio.to_thread(
-        _store().replace_rating_snapshots,
+    credentials_cache[user_id] = StoredCredentials(
         telegram_user_id=user_id,
-        snapshots=rating_items_to_snapshots(items),
+        login=login_value,
+        password=password_value,
     )
+    await save_rating_items_cache(user_id, items)
     await save_schedule_baseline_if_available(
         telegram_user_id=user_id,
         login=login_value,
@@ -623,7 +675,7 @@ async def handle_schedule_day(message: Message, state: FSMContext) -> None:
         await _log_event(message, "schedule_day", result_status="no_telegram_user", response_text=response)
         await message.answer(response, reply_markup=ReplyKeyboardRemove())
         return
-    credentials = _store().get_credentials(user_id)
+    credentials = _get_credentials(user_id)
     if credentials is None:
         await state.set_state(RatingStates.waiting_for_login)
         await state.update_data(pending_action="schedule")
@@ -632,61 +684,45 @@ async def handle_schedule_day(message: Message, state: FSMContext) -> None:
         await message.answer(response, reply_markup=_back_keyboard())
         return
 
-    try:
-        html = await asyncio.to_thread(
-            ScheduleClient(login=credentials.login, password=credentials.password).fetch_week_html
+    cached_schedule = await get_cached_schedule_snapshot(user_id)
+    if cached_schedule is not None:
+        start_schedule_cache_refresh(
+            telegram_user_id=user_id,
+            credentials=credentials,
+            source="schedule_day",
         )
-        week = parse_schedule_html(html)
-        current_schedule_text = schedule_snapshot_text(week)
-        previous_schedule_snapshot = await asyncio.to_thread(_store().get_schedule_snapshot, user_id)
-        if previous_schedule_snapshot is None:
-            await asyncio.to_thread(
-                _store().save_schedule_snapshot,
-                telegram_user_id=user_id,
-                schedule_key=schedule_week_key(week),
-                schedule_hash=hashlib.sha256(current_schedule_text.encode("utf-8")).hexdigest(),
-                schedule_text=current_schedule_text,
-            )
-    except (ScheduleFetchError, ScheduleParseError) as exc:
-        response = f"Не удалось получить расписание: {exc}"
+        response = format_schedule_snapshot(cached_schedule, day_query)
         await _log_event(
             message,
             "schedule_day",
             message_text=day_query,
-            result_status="fetch_failed",
+            result_status="cache_hit",
             response_text=response,
-            error_message=str(exc),
         )
-        await message.answer(response, reply_markup=_action_keyboard(user_id))
+        for index, response_part in enumerate(split_telegram_text(response)):
+            await message.answer(
+                response_part,
+                reply_markup=_action_keyboard(user_id) if index == 0 else None,
+            )
         await state.set_state(RatingStates.waiting_for_action)
         return
 
-    if _is_full_schedule_request(day_query):
-        response = format_schedule_week(week)
-    else:
-        day = find_schedule_day(week, day_query)
-        if day is None:
-            response = "На сайте расписания нет выбранного дня для текущей недели."
-        else:
-            response = format_schedule_day(
-                day,
-                group_name=week.group_name,
-                week_num=week.week_num,
-            )
-
+    start_schedule_cache_refresh(
+        telegram_user_id=user_id,
+        credentials=credentials,
+        source="schedule_day_no_cache",
+    )
+    response = "Расписание еще не сохранено. Обновляю его в фоне, попробуйте еще раз через минуту."
     await _log_event(
         message,
         "schedule_day",
         message_text=day_query,
-        result_status="found",
+        result_status="cache_missing",
         response_text=response,
     )
-    for index, response_part in enumerate(split_telegram_text(response)):
-        await message.answer(
-            response_part,
-            reply_markup=_action_keyboard(user_id) if index == 0 else None,
-        )
+    await message.answer(response, reply_markup=_action_keyboard(user_id))
     await state.set_state(RatingStates.waiting_for_action)
+    return
 
 
 @router.message(RatingStates.waiting_for_subject, F.text)
@@ -747,7 +783,7 @@ async def start_schedule_flow(message: Message, state: FSMContext) -> None:
         await message.answer(response)
         return
 
-    credentials = _store().get_credentials(user_id)
+    credentials = _get_credentials(user_id)
     if credentials is None:
         await state.set_state(RatingStates.waiting_for_login)
         await state.update_data(pending_action="schedule")
@@ -805,6 +841,10 @@ async def delete_user_data(message: Message, state: FSMContext) -> None:
         return
 
     await asyncio.to_thread(_store().delete_credentials, user_id)
+    notification_settings_cache.pop(user_id, None)
+    credentials_cache.pop(user_id, None)
+    rating_items_cache.pop(user_id, None)
+    schedule_snapshot_cache.pop(user_id, None)
     await state.clear()
     await state.set_state(RatingStates.waiting_for_action)
     response = "Данные удалены. Чтобы снова пользоваться ботом, нажмите Старт и войдите в ЛКС."
@@ -826,19 +866,18 @@ async def toggle_notifications(message: Message, state: FSMContext) -> None:
         await message.answer(response)
         return
 
-    enabled = await asyncio.to_thread(_store().toggle_notifications_enabled, user_id)
-    credentials = await asyncio.to_thread(_store().get_credentials, user_id)
-    baseline_status = ""
+    enabled = not notification_settings_cache.get(user_id, True)
+    notification_settings_cache[user_id] = enabled
+    asyncio.create_task(_save_notification_setting(user_id, enabled))
+    credentials = _get_credentials(user_id)
     if enabled and credentials is not None:
-        baseline_status = await refresh_user_baselines_if_available(user_id, credentials)
+        asyncio.create_task(refresh_user_baselines_if_available(user_id, credentials))
 
     response = (
-        "Уведомления включены. Бот будет проверять изменения примерно раз в час."
+        "Уведомления включены. Бот будет проверять изменения примерно раз в час. Текущий снимок обновится в фоне."
         if enabled
         else "Уведомления выключены. Автоматические сообщения о баллах и расписании приходить не будут."
     )
-    if baseline_status:
-        response = f"{response}\n{baseline_status}"
     await _log_event(
         message,
         "notifications",
@@ -872,6 +911,7 @@ async def fetch_rating_items(credentials) -> list[RatingItem]:
 
 
 async def save_rating_items_cache(telegram_user_id: int, items: list[RatingItem]) -> None:
+    rating_items_cache[telegram_user_id] = items
     await asyncio.to_thread(
         _store().replace_rating_snapshots,
         telegram_user_id=telegram_user_id,
@@ -880,8 +920,15 @@ async def save_rating_items_cache(telegram_user_id: int, items: list[RatingItem]
 
 
 async def get_cached_rating_items(telegram_user_id: int) -> list[RatingItem]:
+    cached_items = rating_items_cache.get(telegram_user_id)
+    if cached_items is not None:
+        return cached_items
+
     snapshots = await asyncio.to_thread(_store().get_rating_snapshots, telegram_user_id)
-    return rating_snapshots_to_items(snapshots)
+    items = rating_snapshots_to_items(snapshots)
+    if items:
+        rating_items_cache[telegram_user_id] = items
+    return items
 
 
 def start_rating_cache_refresh(
@@ -947,6 +994,172 @@ def _finish_rating_cache_refresh(telegram_user_id: int, task: asyncio.Task) -> N
         logging.exception("Rating cache refresh task failed")
 
 
+async def get_cached_schedule_snapshot(telegram_user_id: int) -> ScheduleSnapshot | None:
+    cached_snapshot = schedule_snapshot_cache.get(telegram_user_id)
+    if cached_snapshot is not None:
+        return cached_snapshot
+
+    snapshot = await asyncio.to_thread(_store().get_schedule_snapshot, telegram_user_id)
+    if snapshot is not None:
+        schedule_snapshot_cache[telegram_user_id] = snapshot
+    return snapshot
+
+
+async def save_schedule_snapshot_cache(
+    *,
+    telegram_user_id: int,
+    schedule_key: str | None,
+    schedule_hash: str,
+    schedule_text: str,
+) -> None:
+    schedule_snapshot_cache[telegram_user_id] = ScheduleSnapshot(
+        telegram_user_id=telegram_user_id,
+        schedule_key=schedule_key,
+        schedule_hash=schedule_hash,
+        schedule_text=schedule_text,
+    )
+    await asyncio.to_thread(
+        _store().save_schedule_snapshot,
+        telegram_user_id=telegram_user_id,
+        schedule_key=schedule_key,
+        schedule_hash=schedule_hash,
+        schedule_text=schedule_text,
+    )
+
+
+def start_schedule_cache_refresh(
+    *,
+    telegram_user_id: int,
+    credentials,
+    source: str,
+) -> None:
+    existing_task = schedule_cache_refresh_tasks.get(telegram_user_id)
+    if existing_task is not None and not existing_task.done():
+        return
+
+    task = asyncio.create_task(
+        refresh_schedule_cache(
+            telegram_user_id=telegram_user_id,
+            credentials=credentials,
+            source=source,
+        )
+    )
+    schedule_cache_refresh_tasks[telegram_user_id] = task
+    task.add_done_callback(
+        lambda finished_task: _finish_schedule_cache_refresh(
+            telegram_user_id,
+            finished_task,
+        )
+    )
+
+
+async def refresh_schedule_cache(
+    *,
+    telegram_user_id: int,
+    credentials,
+    source: str,
+) -> None:
+    try:
+        html = await asyncio.to_thread(
+            ScheduleClient(login=credentials.login, password=credentials.password).fetch_week_html
+        )
+        schedule_hash, schedule_text, schedule_key, _ = build_schedule_snapshot(html)
+        await save_schedule_snapshot_cache(
+            telegram_user_id=telegram_user_id,
+            schedule_key=schedule_key,
+            schedule_hash=schedule_hash,
+            schedule_text=schedule_text,
+        )
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="schedule_cache_refresh",
+            result_status="success",
+            response_text=f"source={source} lessons={len(schedule_text.splitlines())}",
+        )
+    except (ScheduleFetchError, ScheduleParseError) as exc:
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="schedule_cache_refresh",
+            result_status="failed",
+            response_text=f"source={source}",
+            error_message=str(exc),
+        )
+
+
+def _finish_schedule_cache_refresh(telegram_user_id: int, task: asyncio.Task) -> None:
+    if schedule_cache_refresh_tasks.get(telegram_user_id) is task:
+        schedule_cache_refresh_tasks.pop(telegram_user_id, None)
+
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logging.info("Schedule cache refresh task was cancelled")
+    except Exception:
+        logging.exception("Schedule cache refresh task failed")
+
+
+def format_schedule_snapshot(snapshot: ScheduleSnapshot, day_query: str) -> str:
+    groups = _group_schedule_snapshot_lines(snapshot.schedule_text)
+    if _is_full_schedule_request(day_query):
+        if not groups:
+            return "Расписание на текущую неделю пока пустое."
+        parts = ["Расписание на текущую неделю"]
+        parts.extend(_format_cached_schedule_day(day_title, lessons) for day_title, lessons in groups)
+        return "\n\n".join(parts)
+
+    normalized_day = _normalize_message_text(day_query)
+    for day_title, lessons in groups:
+        weekday = day_title.split(",", 1)[0]
+        if _normalize_message_text(weekday) == normalized_day:
+            return _format_cached_schedule_day(day_title, lessons)
+
+    return "На сайте расписания нет выбранного дня для текущей недели."
+
+
+def _group_schedule_snapshot_lines(schedule_text: str) -> list[tuple[str, list[tuple[str, str, str, str, str]]]]:
+    groups: list[tuple[str, list[tuple[str, str, str, str, str]]]] = []
+    index_by_day: dict[str, int] = {}
+
+    for line in schedule_text.splitlines():
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 6:
+            continue
+
+        day_title, time_value, subject, lesson_type, place, teacher = parts[:6]
+        if day_title not in index_by_day:
+            index_by_day[day_title] = len(groups)
+            groups.append((day_title, []))
+
+        groups[index_by_day[day_title]][1].append(
+            (time_value, subject, lesson_type, place, teacher)
+        )
+
+    return groups
+
+
+def _format_cached_schedule_day(
+    day_title: str,
+    lessons: list[tuple[str, str, str, str, str]],
+) -> str:
+    lines = [day_title]
+    if not lessons:
+        lines.append("Занятий нет.")
+        return "\n".join(lines)
+
+    for time_value, subject, lesson_type, place, teacher in lessons:
+        lines.append("")
+        lines.append(time_value)
+        lines.append(subject)
+        if lesson_type and lesson_type != "-":
+            lines.append(f"Тип: {lesson_type}")
+        if place and place != "-":
+            lines.append(f"Место: {place}")
+        if teacher and teacher != "-":
+            lines.append(f"Преподаватель: {teacher}")
+
+    return "\n".join(lines)
+
+
 def rating_snapshots_to_items(snapshots: dict[str, RatingSnapshot]) -> list[RatingItem]:
     return [
         RatingItem(
@@ -1007,7 +1220,7 @@ async def start_rating_flow(message: Message, state: FSMContext) -> None:
         await message.answer(response)
         return
 
-    credentials = _store().get_credentials(user_id)
+    credentials = _get_credentials(user_id)
     if credentials is None:
         await state.set_state(RatingStates.waiting_for_login)
         await state.update_data(pending_action="rating")
@@ -1066,7 +1279,7 @@ async def answer_subject(message: Message) -> None:
         await message.answer(response)
         return
 
-    credentials = _store().get_credentials(user_id)
+    credentials = _get_credentials(user_id)
     if credentials is None:
         response = "Сначала войдите в личный кабинет РЭУ. Нажмите Баллы или Расписание пар."
         await _log_event(message, "subject_query", message_text=subject_query, subject_query=subject_query, result_status="no_credentials", response_text=response)
@@ -1260,8 +1473,7 @@ async def save_schedule_baseline_if_available(
                 raise ScheduleFetchError("Нет логина и пароля для сохранения снимка расписания.")
             html = await asyncio.to_thread(ScheduleClient(login=login, password=password).fetch_week_html)
         schedule_hash, schedule_text, schedule_key, _ = build_schedule_snapshot(html)
-        await asyncio.to_thread(
-            _store().save_schedule_snapshot,
+        await save_schedule_snapshot_cache(
             telegram_user_id=telegram_user_id,
             schedule_key=schedule_key,
             schedule_hash=schedule_hash,
@@ -1290,11 +1502,7 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             password=credentials.password,
         )
         items = parse_rating_items_from_html(rating_html)
-        await asyncio.to_thread(
-            _store().replace_rating_snapshots,
-            telegram_user_id=telegram_user_id,
-            snapshots=rating_items_to_snapshots(items),
-        )
+        await save_rating_items_cache(telegram_user_id, items)
         await save_schedule_baseline_if_available(
             telegram_user_id=telegram_user_id,
             html=schedule_html,
@@ -1501,11 +1709,7 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
         snapshots = rating_items_to_snapshots(items)
 
         if not previous:
-            await asyncio.to_thread(
-                _store().replace_rating_snapshots,
-                telegram_user_id=telegram_user_id,
-                snapshots=snapshots,
-            )
+            await save_rating_items_cache(telegram_user_id, items)
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="rating_monitor",
@@ -1517,11 +1721,7 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
         changes = collect_rating_changes(previous, items)
 
         if not changes:
-            await asyncio.to_thread(
-                _store().replace_rating_snapshots,
-                telegram_user_id=telegram_user_id,
-                snapshots=snapshots,
-            )
+            await save_rating_items_cache(telegram_user_id, items)
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="rating_monitor",
@@ -1533,11 +1733,7 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
         notification = format_rating_change_notification(changes)
         for notification_part in split_telegram_text(notification):
             await bot.send_message(chat_id=telegram_user_id, text=notification_part)
-        await asyncio.to_thread(
-            _store().replace_rating_snapshots,
-            telegram_user_id=telegram_user_id,
-            snapshots=snapshots,
-        )
+        await save_rating_items_cache(telegram_user_id, items)
         await _log_store_event(
             telegram_user_id=telegram_user_id,
             event_type="rating_change",
@@ -1567,8 +1763,7 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
         previous = await asyncio.to_thread(_store().get_schedule_snapshot, telegram_user_id)
 
         if previous is None:
-            await asyncio.to_thread(
-                _store().save_schedule_snapshot,
+            await save_schedule_snapshot_cache(
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
@@ -1584,8 +1779,7 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
 
         previous_key = previous.schedule_key or infer_schedule_week_key_from_snapshot_text(previous.schedule_text)
         if previous_key is None:
-            await asyncio.to_thread(
-                _store().save_schedule_snapshot,
+            await save_schedule_snapshot_cache(
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
@@ -1603,8 +1797,7 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
             notification = format_new_week_schedule_notification(current_week)
             for notification_part in split_telegram_text(notification):
                 await bot.send_message(chat_id=telegram_user_id, text=notification_part)
-            await asyncio.to_thread(
-                _store().save_schedule_snapshot,
+            await save_schedule_snapshot_cache(
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
@@ -1619,8 +1812,7 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
             return
 
         if previous.schedule_key is None and previous.schedule_hash == current_hash:
-            await asyncio.to_thread(
-                _store().save_schedule_snapshot,
+            await save_schedule_snapshot_cache(
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
@@ -1646,8 +1838,7 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
         notification = format_schedule_change_notification(previous.schedule_text, current_text)
         for notification_part in split_telegram_text(notification):
             await bot.send_message(chat_id=telegram_user_id, text=notification_part)
-        await asyncio.to_thread(
-            _store().save_schedule_snapshot,
+        await save_schedule_snapshot_cache(
             telegram_user_id=telegram_user_id,
             schedule_key=current_key,
             schedule_hash=current_hash,
@@ -1783,6 +1974,7 @@ async def stop_monitor_task(app: web.Application) -> None:
 def run_webhook() -> None:
     global store
     store = UserStore()
+    _warm_runtime_caches()
     bot = Bot(token=get_bot_token())
     dispatcher = create_dispatcher()
     dispatcher.startup.register(on_webhook_startup)
@@ -1809,6 +2001,7 @@ def run_webhook() -> None:
 async def run_polling() -> None:
     global store
     store = UserStore()
+    _warm_runtime_caches()
     bot = Bot(token=get_bot_token())
     dispatcher = create_dispatcher()
     await configure_bot_profile(bot)

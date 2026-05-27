@@ -2,8 +2,8 @@ name: Daytime keepalive
 
 on:
   schedule:
-    # 07:00-23:50 Moscow time. GitHub cron uses UTC.
-    - cron: "*/10 4-20 * * *"
+    # 07:00-23:55 Moscow time. GitHub cron uses UTC.
+    - cron: "*/5 4-20 * * *"
   workflow_dispatch:
 
 jobs:

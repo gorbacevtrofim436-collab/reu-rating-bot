@@ -481,6 +481,28 @@ class UserStore:
             return True
         return bool(row[0])
 
+    def list_notification_settings(self) -> dict[int, bool]:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT telegram_user_id, notifications_enabled
+                        FROM user_settings
+                        """
+                    )
+                    rows = cursor.fetchall()
+        else:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT telegram_user_id, notifications_enabled
+                    FROM user_settings
+                    """
+                ).fetchall()
+
+        return {int(telegram_user_id): bool(enabled) for telegram_user_id, enabled in rows}
+
     def set_notifications_enabled(self, telegram_user_id: int, enabled: bool) -> None:
         if self.use_postgres:
             with self._pg_connect() as connection:
@@ -555,6 +577,41 @@ class UserStore:
             )
             for row in rows
         }
+
+    def list_rating_snapshots(self) -> dict[int, dict[str, RatingSnapshot]]:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT telegram_user_id, subject, total, attendance, control, creative, intermediate
+                        FROM rating_snapshots
+                        ORDER BY telegram_user_id, subject
+                        """
+                    )
+                    rows = cursor.fetchall()
+        else:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT telegram_user_id, subject, total, attendance, control, creative, intermediate
+                    FROM rating_snapshots
+                    ORDER BY telegram_user_id, subject
+                    """
+                ).fetchall()
+
+        snapshots_by_user: dict[int, dict[str, RatingSnapshot]] = {}
+        for telegram_user_id, subject, total, attendance, control, creative, intermediate in rows:
+            user_snapshots = snapshots_by_user.setdefault(int(telegram_user_id), {})
+            user_snapshots[subject] = RatingSnapshot(
+                subject=subject,
+                total=total,
+                attendance=attendance,
+                control=control,
+                creative=creative,
+                intermediate=intermediate,
+            )
+        return snapshots_by_user
 
     def replace_rating_snapshots(
         self,
@@ -703,6 +760,36 @@ class UserStore:
             schedule_text=row[1],
             schedule_key=row[2],
         )
+
+    def list_schedule_snapshots(self) -> dict[int, ScheduleSnapshot]:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT telegram_user_id, schedule_hash, schedule_text, schedule_key
+                        FROM schedule_snapshots
+                        """
+                    )
+                    rows = cursor.fetchall()
+        else:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT telegram_user_id, schedule_hash, schedule_text, schedule_key
+                    FROM schedule_snapshots
+                    """
+                ).fetchall()
+
+        return {
+            int(telegram_user_id): ScheduleSnapshot(
+                telegram_user_id=int(telegram_user_id),
+                schedule_hash=schedule_hash,
+                schedule_text=schedule_text,
+                schedule_key=schedule_key,
+            )
+            for telegram_user_id, schedule_hash, schedule_text, schedule_key in rows
+        }
 
     def save_schedule_snapshot(
         self,

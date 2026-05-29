@@ -7,6 +7,7 @@ import hmac
 import logging
 import os
 import random
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -54,6 +55,9 @@ class RatingStates(StatesGroup):
 store: UserStore | None = None
 rating_cache_refresh_tasks: dict[int, asyncio.Task] = {}
 schedule_cache_refresh_tasks: dict[int, asyncio.Task] = {}
+initial_baseline_refresh_tasks: dict[int, asyncio.Task] = {}
+rating_cache_refresh_started_at: dict[int, float] = {}
+schedule_cache_refresh_started_at: dict[int, float] = {}
 notification_settings_cache: dict[int, bool] = {}
 credentials_cache: dict[int, StoredCredentials] = {}
 rating_items_cache: dict[int, list[RatingItem]] = {}
@@ -185,6 +189,33 @@ def _get_credentials(telegram_user_id: int):
             password=credentials.password,
         )
     return credentials
+
+
+def _forget_user_runtime_data(telegram_user_id: int) -> None:
+    notification_settings_cache.pop(telegram_user_id, None)
+    credentials_cache.pop(telegram_user_id, None)
+    rating_items_cache.pop(telegram_user_id, None)
+    schedule_snapshot_cache.pop(telegram_user_id, None)
+    rating_cache_refresh_started_at.pop(telegram_user_id, None)
+    schedule_cache_refresh_started_at.pop(telegram_user_id, None)
+
+
+def _is_invalid_credentials_error(exc: Exception) -> bool:
+    return "не принял логин или пароль" in str(exc).casefold()
+
+
+def _interactive_refresh_allowed(
+    started_at: dict[int, float],
+    telegram_user_id: int,
+) -> bool:
+    cooldown = max(_env_float("INTERACTIVE_REFRESH_COOLDOWN_SECONDS", 1800.0), 0.0)
+    now = time.monotonic()
+    last_started_at = started_at.get(telegram_user_id)
+    if last_started_at is not None and now - last_started_at < cooldown:
+        return False
+
+    started_at[telegram_user_id] = now
+    return True
 
 
 def _telegram_user_id(message: Message) -> int | None:
@@ -453,10 +484,7 @@ async def logout(message: Message, state: FSMContext) -> None:
     user_id = _telegram_user_id(message)
     if user_id is not None:
         await asyncio.to_thread(_store().delete_credentials, user_id)
-        notification_settings_cache.pop(user_id, None)
-        credentials_cache.pop(user_id, None)
-        rating_items_cache.pop(user_id, None)
-        schedule_snapshot_cache.pop(user_id, None)
+        _forget_user_runtime_data(user_id)
     await state.clear()
     response = "Данные входа и сохраненные снимки удалены."
     await _log_event(message, "command", message_text="/logout", result_status="credentials_deleted", response_text=response)
@@ -587,21 +615,12 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         await message.answer(response, reply_markup=_back_keyboard())
         return
 
-    await _log_event(message, "rea_password", result_status="check_started", response_text="Проверяю вход в личный кабинет...")
-    await message.answer("Проверяю вход в личный кабинет...")
-
-    try:
-        html, schedule_html, schedule_error = await asyncio.to_thread(
-            fetch_rating_and_schedule_html_once,
-            login=login_value,
-            password=password_value,
-        )
-        items = parse_rating_items_from_html(html)
-    except (RatingFetchError, RatingParseError) as exc:
-        response = f"Не удалось войти или получить рейтинг: {exc}"
-        await _log_event(message, "rea_login_result", result_status="failed", response_text=response, error_message=str(exc))
-        await message.answer(response)
-        return
+    await _log_event(
+        message,
+        "rea_password",
+        result_status="credentials_received",
+        response_text="Сохраняю данные входа и загружаю информацию из ЛКС в фоне.",
+    )
 
     await asyncio.to_thread(
         _store().save_credentials,
@@ -614,33 +633,23 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         login=login_value,
         password=password_value,
     )
-    await save_rating_items_cache(user_id, items)
-    await save_schedule_baseline_if_available(
-        telegram_user_id=user_id,
-        login=login_value,
-        password=password_value,
-        html=schedule_html,
-        fetch_error=schedule_error,
-    )
 
     data = await state.get_data()
     pending_action = str(data.get("pending_action") or "").strip()
-    await _log_event(message, "rea_login_result", message_text=login_value, result_status="success")
-
-    if pending_action == "schedule":
-        await state.update_data(pending_action=None)
-        await ask_schedule_day(message, state, prefix="Готово. Данные входа сохранены.")
-        return
-
-    if pending_action == "rating":
-        await state.update_data(pending_action=None)
-        await ask_subject_from_items(message, state, items, prefix="Готово. Данные входа сохранены.")
-        return
-
     await state.update_data(pending_action=None)
-    response = "Готово. Данные входа сохранены."
-    await message.answer(response)
-    await show_action_menu(message, state)
+    await state.set_state(RatingStates.waiting_for_action)
+    start_initial_baseline_refresh(
+        bot=message.bot,
+        telegram_user_id=user_id,
+        credentials=credentials_cache[user_id],
+        source=f"login:{pending_action or 'menu'}",
+    )
+    response = (
+        "Данные входа сохранены. Загружаю баллы и расписание из ЛКС в фоне.\n"
+        "Когда загрузка завершится, я напишу сюда. Если ЛКС не примет логин или пароль, данные будут удалены."
+    )
+    await _log_event(message, "rea_login_result", message_text=login_value, result_status="saved_pending", response_text=response)
+    await message.answer(response, reply_markup=_action_keyboard(user_id))
 
 
 @router.message(RatingStates.waiting_for_schedule_day, F.text)
@@ -841,10 +850,7 @@ async def delete_user_data(message: Message, state: FSMContext) -> None:
         return
 
     await asyncio.to_thread(_store().delete_credentials, user_id)
-    notification_settings_cache.pop(user_id, None)
-    credentials_cache.pop(user_id, None)
-    rating_items_cache.pop(user_id, None)
-    schedule_snapshot_cache.pop(user_id, None)
+    _forget_user_runtime_data(user_id)
     await state.clear()
     await state.set_state(RatingStates.waiting_for_action)
     response = "Данные удалены. Чтобы снова пользоваться ботом, нажмите Старт и войдите в ЛКС."
@@ -939,6 +945,8 @@ def start_rating_cache_refresh(
 ) -> None:
     existing_task = rating_cache_refresh_tasks.get(telegram_user_id)
     if existing_task is not None and not existing_task.done():
+        return
+    if not _interactive_refresh_allowed(rating_cache_refresh_started_at, telegram_user_id):
         return
 
     task = asyncio.create_task(
@@ -1036,6 +1044,8 @@ def start_schedule_cache_refresh(
     existing_task = schedule_cache_refresh_tasks.get(telegram_user_id)
     if existing_task is not None and not existing_task.done():
         return
+    if not _interactive_refresh_allowed(schedule_cache_refresh_started_at, telegram_user_id):
+        return
 
     task = asyncio.create_task(
         refresh_schedule_cache(
@@ -1096,6 +1106,69 @@ def _finish_schedule_cache_refresh(telegram_user_id: int, task: asyncio.Task) ->
         logging.info("Schedule cache refresh task was cancelled")
     except Exception:
         logging.exception("Schedule cache refresh task failed")
+
+
+def start_initial_baseline_refresh(
+    *,
+    bot: Bot,
+    telegram_user_id: int,
+    credentials,
+    source: str,
+) -> None:
+    existing_task = initial_baseline_refresh_tasks.get(telegram_user_id)
+    if existing_task is not None and not existing_task.done():
+        return
+
+    task = asyncio.create_task(
+        refresh_initial_baseline_and_notify(
+            bot=bot,
+            telegram_user_id=telegram_user_id,
+            credentials=credentials,
+            source=source,
+        )
+    )
+    initial_baseline_refresh_tasks[telegram_user_id] = task
+    task.add_done_callback(
+        lambda finished_task: _finish_initial_baseline_refresh(
+            telegram_user_id,
+            finished_task,
+        )
+    )
+
+
+async def refresh_initial_baseline_and_notify(
+    *,
+    bot: Bot,
+    telegram_user_id: int,
+    credentials,
+    source: str,
+) -> None:
+    status = await refresh_user_baselines_if_available(telegram_user_id, credentials)
+    await _log_store_event(
+        telegram_user_id=telegram_user_id,
+        event_type="initial_sync",
+        result_status="completed",
+        response_text=f"source={source} {status}",
+    )
+    await bot.send_message(
+        chat_id=telegram_user_id,
+        text=status,
+        reply_markup=_action_keyboard(telegram_user_id)
+        if _get_credentials(telegram_user_id) is not None
+        else _start_keyboard(),
+    )
+
+
+def _finish_initial_baseline_refresh(telegram_user_id: int, task: asyncio.Task) -> None:
+    if initial_baseline_refresh_tasks.get(telegram_user_id) is task:
+        initial_baseline_refresh_tasks.pop(telegram_user_id, None)
+
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logging.info("Initial baseline refresh task was cancelled")
+    except Exception:
+        logging.exception("Initial baseline refresh task failed")
 
 
 def format_schedule_snapshot(snapshot: ScheduleSnapshot, day_query: str) -> str:
@@ -1239,23 +1312,23 @@ async def start_rating_flow(message: Message, state: FSMContext) -> None:
         await ask_subject_from_items(message, state, cached_items)
         return
 
-    try:
-        items = await fetch_rating_items(credentials)
-        await save_rating_items_cache(user_id, items)
-    except (RatingFetchError, RatingParseError) as exc:
-        response = f"Не удалось получить список предметов: {exc}"
-        await _log_event(
-            message,
-            "rating_start",
-            result_status="fetch_failed",
-            response_text=response,
-            error_message=str(exc),
-        )
-        await message.answer(response, reply_markup=_action_keyboard(user_id))
-        await state.set_state(RatingStates.waiting_for_action)
-        return
-
-    await ask_subject_from_items(message, state, items)
+    start_initial_baseline_refresh(
+        bot=message.bot,
+        telegram_user_id=user_id,
+        credentials=credentials,
+        source="rating_start_no_cache",
+    )
+    response = (
+        "Баллы еще загружаются из ЛКС. Я делаю это в фоне и напишу, когда данные будут готовы."
+    )
+    await _log_event(
+        message,
+        "rating_start",
+        result_status="cache_missing",
+        response_text=response,
+    )
+    await message.answer(response, reply_markup=_action_keyboard(user_id))
+    await state.set_state(RatingStates.waiting_for_action)
 
 
 async def answer_subject(message: Message) -> None:
@@ -1323,52 +1396,22 @@ async def answer_subject(message: Message) -> None:
         await message.answer(response, reply_markup=_subject_keyboard(cached_items))
         return
 
-    client = RatingClient(login=credentials.login, password=credentials.password)
-    try:
-        html = await asyncio.to_thread(client.fetch_html)
-        items = parse_rating_items_from_html(html)
-        await save_rating_items_cache(user_id, items)
-    except (RatingFetchError, RatingParseError) as exc:
-        response = f"Не удалось получить баллы: {exc}"
-        await _log_event(
-            message,
-            "subject_query",
-            message_text=subject_query,
-            subject_query=subject_query,
-            result_status="fetch_failed",
-            response_text=response,
-            error_message=str(exc),
-        )
-        await message.answer(response)
-        return
-
-    item = find_subject_score(items, subject_query)
-    if item is None:
-        available = ", ".join(sorted({entry.subject for entry in items})[:10])
-        suffix = f"\nДоступные предметы: {available}" if available else ""
-        response = f"Предмет не найден.{suffix}"
-        await _log_event(
-            message,
-            "subject_query",
-            message_text=subject_query,
-            subject_query=subject_query,
-            result_status="not_found",
-            response_text=response,
-        )
-        await message.answer(response, reply_markup=_subject_keyboard(items))
-        return
-
-    response = format_rating_item(item)
+    start_initial_baseline_refresh(
+        bot=message.bot,
+        telegram_user_id=user_id,
+        credentials=credentials,
+        source="subject_query_no_cache",
+    )
+    response = "Баллы еще загружаются из ЛКС. Я напишу, когда данные будут готовы."
     await _log_event(
         message,
         "subject_query",
         message_text=subject_query,
         subject_query=subject_query,
-        subject_matched=item.subject,
-        result_status="found",
+        result_status="cache_missing",
         response_text=response,
     )
-    await message.answer(response, reply_markup=_subject_keyboard(items))
+    await message.answer(response, reply_markup=_action_keyboard(user_id))
 
 
 def format_rating_item(item: RatingItem) -> str:
@@ -1516,13 +1559,30 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
         )
         return "Текущий снимок обновлен, старые изменения не будут приходить задним числом."
     except (RatingFetchError, RatingParseError) as exc:
+        if _is_invalid_credentials_error(exc):
+            await asyncio.to_thread(_store().delete_credentials, telegram_user_id)
+            _forget_user_runtime_data(telegram_user_id)
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="notifications",
+                result_status="invalid_credentials",
+                error_message=str(exc),
+            )
+            return (
+                "ЛКС не принял логин или пароль. Я удалил сохраненные данные. "
+                "Проверьте логин и пароль и войдите заново."
+            )
+
         await _log_store_event(
             telegram_user_id=telegram_user_id,
             event_type="notifications",
             result_status="baseline_refresh_failed",
             error_message=str(exc),
         )
-        return "Текущий снимок пока не обновился: сайт РЭУ не ответил или изменил страницу."
+        return (
+            "ЛКС РЭУ сейчас не ответил, поэтому баллы и расписание пока не загрузились. "
+            "Данные входа сохранены, я попробую обновить их при следующей проверке."
+        )
 
 
 def format_schedule_change_notification(previous_text: str, current_text: str) -> str:
@@ -1660,6 +1720,24 @@ async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCr
             password=credentials.password,
         )
     except RatingFetchError as exc:
+        if _is_invalid_credentials_error(exc):
+            await asyncio.to_thread(_store().delete_credentials, telegram_user_id)
+            _forget_user_runtime_data(telegram_user_id)
+            response = (
+                "ЛКС не принял сохраненный логин или пароль. "
+                "Я удалил данные входа, войдите заново."
+            )
+            with contextlib.suppress(Exception):
+                await bot.send_message(chat_id=telegram_user_id, text=response, reply_markup=_start_keyboard())
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="rating_monitor",
+                result_status="invalid_credentials",
+                error_message=str(exc),
+                response_text=response,
+            )
+            return
+
         await _log_store_event(
             telegram_user_id=telegram_user_id,
             event_type="rating_monitor",

@@ -25,6 +25,8 @@ services:
         value: 30
       - key: MONITOR_JITTER_SECONDS
         value: 60
+      - key: INTERACTIVE_REFRESH_COOLDOWN_SECONDS
+        value: 1800
       - key: BOT_TOKEN
         sync: false
       - key: BOT_CREDENTIAL_KEY

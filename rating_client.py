@@ -27,10 +27,10 @@ def create_rea_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     retry = Retry(
-        total=_env_int("REA_HTTP_RETRIES", 2),
-        connect=_env_int("REA_HTTP_CONNECT_RETRIES", 2),
-        read=_env_int("REA_HTTP_READ_RETRIES", 2),
-        status=_env_int("REA_HTTP_STATUS_RETRIES", 2),
+        total=_env_int("REA_HTTP_RETRIES", 0),
+        connect=_env_int("REA_HTTP_CONNECT_RETRIES", 0),
+        read=_env_int("REA_HTTP_READ_RETRIES", 0),
+        status=_env_int("REA_HTTP_STATUS_RETRIES", 0),
         backoff_factor=_env_float("REA_HTTP_BACKOFF_FACTOR", 0.8),
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "POST"}),
@@ -83,7 +83,7 @@ class RatingClient:
             if cookie_header is not None
             else "" if has_explicit_credentials else os.getenv("REA_COOKIE_HEADER", "")
         ).strip()
-        self.timeout = float(os.getenv("REA_REQUEST_TIMEOUT", "15"))
+        self.timeout = float(os.getenv("REA_REQUEST_TIMEOUT", "10"))
 
     def fetch_html(self) -> str:
         session = create_rea_session()

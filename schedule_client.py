@@ -28,7 +28,7 @@ class ScheduleClient:
             if cookie_header is not None
             else "" if has_explicit_credentials else os.getenv("REA_COOKIE_HEADER", "")
         ).strip()
-        self.timeout = float(os.getenv("REA_SCHEDULE_REQUEST_TIMEOUT", os.getenv("REA_REQUEST_TIMEOUT", "15")))
+        self.timeout = float(os.getenv("REA_SCHEDULE_REQUEST_TIMEOUT", os.getenv("REA_REQUEST_TIMEOUT", "10")))
 
     def fetch_week_html(self) -> str:
         session = create_rea_session()

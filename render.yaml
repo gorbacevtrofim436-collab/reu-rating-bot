@@ -22,11 +22,13 @@ services:
       - key: MONITOR_INITIAL_DELAY_SECONDS
         value: 60
       - key: MONITOR_USER_DELAY_SECONDS
-        value: 30
+        value: 120
+      - key: MONITOR_STOP_ON_TRANSIENT_FAILURE
+        value: true
       - key: MONITOR_JITTER_SECONDS
         value: 60
       - key: INTERACTIVE_REFRESH_COOLDOWN_SECONDS
-        value: 1800
+        value: 21600
       - key: BOT_TOKEN
         sync: false
       - key: BOT_CREDENTIAL_KEY
@@ -42,8 +44,16 @@ services:
       - key: REA_LOGIN_URL
         value: https://student.rea.ru/
       - key: REA_REQUEST_TIMEOUT
-        value: 30
+        value: 10
+      - key: REA_HTTP_RETRIES
+        value: 0
+      - key: REA_HTTP_CONNECT_RETRIES
+        value: 0
+      - key: REA_HTTP_READ_RETRIES
+        value: 0
+      - key: REA_HTTP_STATUS_RETRIES
+        value: 0
       - key: REA_LESSONS_URL
         value: https://student.rea.ru/lessons/index.php?login=yes
       - key: REA_SCHEDULE_REQUEST_TIMEOUT
-        value: 30
+        value: 10

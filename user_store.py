@@ -26,6 +26,13 @@ class StoredCredentials:
 
 
 @dataclass(frozen=True)
+class PendingLogin:
+    telegram_user_id: int
+    login: str
+    pending_action: str | None = None
+
+
+@dataclass(frozen=True)
 class RatingSnapshot:
     subject: str
     total: str
@@ -147,6 +154,16 @@ class UserStore:
                     )
                     cursor.execute(
                         """
+                        CREATE TABLE IF NOT EXISTS pending_logins (
+                            telegram_user_id BIGINT PRIMARY KEY,
+                            rea_login TEXT NOT NULL,
+                            pending_action TEXT,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
                         CREATE TABLE IF NOT EXISTS schedule_snapshots (
                             telegram_user_id BIGINT PRIMARY KEY,
                             schedule_key TEXT,
@@ -231,6 +248,16 @@ class UserStore:
                     telegram_user_id INTEGER PRIMARY KEY,
                     notifications_enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_logins (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    rea_login TEXT NOT NULL,
+                    pending_action TEXT,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -541,6 +568,99 @@ class UserStore:
         enabled = not self.notifications_enabled(telegram_user_id)
         self.set_notifications_enabled(telegram_user_id, enabled)
         return enabled
+
+    def save_pending_login(
+        self,
+        *,
+        telegram_user_id: int,
+        rea_login: str,
+        pending_action: str | None = None,
+    ) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO pending_logins (
+                            telegram_user_id,
+                            rea_login,
+                            pending_action
+                        )
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT(telegram_user_id) DO UPDATE SET
+                            rea_login = EXCLUDED.rea_login,
+                            pending_action = EXCLUDED.pending_action,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (telegram_user_id, rea_login, pending_action),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO pending_logins (
+                    telegram_user_id,
+                    rea_login,
+                    pending_action
+                )
+                VALUES (?, ?, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    rea_login = excluded.rea_login,
+                    pending_action = excluded.pending_action,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (telegram_user_id, rea_login, pending_action),
+            )
+
+    def get_pending_login(self, telegram_user_id: int) -> PendingLogin | None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT rea_login, pending_action
+                        FROM pending_logins
+                        WHERE telegram_user_id = %s
+                        """,
+                        (telegram_user_id,),
+                    )
+                    row = cursor.fetchone()
+        else:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT rea_login, pending_action
+                    FROM pending_logins
+                    WHERE telegram_user_id = ?
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+
+        if row is None:
+            return None
+
+        return PendingLogin(
+            telegram_user_id=telegram_user_id,
+            login=row[0],
+            pending_action=row[1],
+        )
+
+    def delete_pending_login(self, telegram_user_id: int) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM pending_logins WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM pending_logins WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
 
     def get_rating_snapshots(self, telegram_user_id: int) -> dict[str, RatingSnapshot]:
         if self.use_postgres:
@@ -860,6 +980,10 @@ class UserStore:
                         "DELETE FROM user_settings WHERE telegram_user_id = %s",
                         (telegram_user_id,),
                     )
+                    cursor.execute(
+                        "DELETE FROM pending_logins WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
             return
 
         with self._connect() as connection:
@@ -877,6 +1001,10 @@ class UserStore:
             )
             connection.execute(
                 "DELETE FROM user_settings WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            connection.execute(
+                "DELETE FROM pending_logins WHERE telegram_user_id = ?",
                 (telegram_user_id,),
             )
 

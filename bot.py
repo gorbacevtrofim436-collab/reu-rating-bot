@@ -204,6 +204,19 @@ def _is_invalid_credentials_error(exc: Exception) -> bool:
     return "не принял логин или пароль" in str(exc).casefold()
 
 
+def _looks_like_rea_login(value: str | None) -> bool:
+    normalized = (value or "").strip()
+    if not normalized or normalized.startswith("/") or " " in normalized:
+        return False
+    if _is_start_button(normalized) or _is_back_button(normalized):
+        return False
+    if _is_rating_request(normalized) or _is_schedule_request(normalized):
+        return False
+    if _is_notifications_request(normalized) or _is_delete_data_request(normalized):
+        return False
+    return "." in normalized and len(normalized) <= 80
+
+
 def _interactive_refresh_allowed(
     started_at: dict[int, float],
     telegram_user_id: int,
@@ -442,6 +455,18 @@ async def start(message: Message, state: FSMContext) -> None:
         await show_action_menu(message, state, prefix="С возвращением.")
         return
 
+    pending_login = await asyncio.to_thread(_store().get_pending_login, user_id)
+    if pending_login is not None:
+        await state.update_data(
+            rea_login=pending_login.login,
+            pending_action=pending_login.pending_action,
+        )
+        await state.set_state(RatingStates.waiting_for_password)
+        response = "Продолжим вход в ЛКС. Введите пароль от личного кабинета РЭУ."
+        await _log_event(message, "command", message_text="/start", result_status="pending_login_restored", response_text=response)
+        await message.answer(response, reply_markup=_back_keyboard())
+        return
+
     await state.set_state(RatingStates.waiting_for_action)
     response = _welcome_caption()
     await _log_event(message, "command", message_text="/start", result_status="welcome_for_new_user", response_text=response)
@@ -531,6 +556,48 @@ async def handle_action_choice(message: Message, state: FSMContext) -> None:
         await start_schedule_flow(message, state)
         return
 
+    user_id = _telegram_user_id(message)
+    if user_id is not None and _get_credentials(user_id) is None:
+        pending_login = await asyncio.to_thread(_store().get_pending_login, user_id)
+        if pending_login is not None:
+            if _looks_like_rea_login(message.text):
+                await state.update_data(
+                    rea_login=message.text.strip(),
+                    pending_action=pending_login.pending_action,
+                )
+                await asyncio.to_thread(
+                    _store().save_pending_login,
+                    telegram_user_id=user_id,
+                    rea_login=message.text.strip(),
+                    pending_action=pending_login.pending_action,
+                )
+                await state.set_state(RatingStates.waiting_for_password)
+                response = "Логин обновлен. Теперь введите пароль от личного кабинета РЭУ."
+                await _log_event(message, "rea_login", message_text=message.text, result_status="pending_login_updated", response_text=response)
+                await message.answer(response, reply_markup=_back_keyboard())
+                return
+
+            await state.update_data(
+                rea_login=pending_login.login,
+                pending_action=pending_login.pending_action,
+            )
+            await state.set_state(RatingStates.waiting_for_password)
+            await handle_password(message, state)
+            return
+
+        if _looks_like_rea_login(message.text):
+            await state.update_data(rea_login=message.text.strip())
+            await asyncio.to_thread(
+                _store().save_pending_login,
+                telegram_user_id=user_id,
+                rea_login=message.text.strip(),
+            )
+            await state.set_state(RatingStates.waiting_for_password)
+            response = "Теперь введите пароль от личного кабинета РЭУ."
+            await _log_event(message, "rea_login", message_text=message.text, result_status="accepted_from_menu", response_text=response)
+            await message.answer(response, reply_markup=_back_keyboard())
+            return
+
     response = "Выберите действие кнопкой ниже."
     await _log_event(message, "action_choice", message_text=message.text, result_status="invalid", response_text=response)
     await message.answer(response, reply_markup=_action_keyboard(_telegram_user_id(message)))
@@ -571,6 +638,16 @@ async def handle_login(message: Message, state: FSMContext) -> None:
         await message.answer(response, reply_markup=_back_keyboard())
         return
 
+    data = await state.get_data()
+    pending_action = str(data.get("pending_action") or "").strip() or None
+    user_id = _telegram_user_id(message)
+    if user_id is not None:
+        await asyncio.to_thread(
+            _store().save_pending_login,
+            telegram_user_id=user_id,
+            rea_login=login_value,
+            pending_action=pending_action,
+        )
     await state.update_data(rea_login=login_value)
     await state.set_state(RatingStates.waiting_for_password)
     response = "Теперь введите пароль от личного кабинета РЭУ."
@@ -596,10 +673,18 @@ async def handle_password(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
     login_value = str(data.get("rea_login", "")).strip()
+    pending_action = str(data.get("pending_action") or "").strip()
+    if not login_value:
+        pending_login = await asyncio.to_thread(_store().get_pending_login, user_id)
+        if pending_login is not None:
+            login_value = pending_login.login
+            pending_action = pending_action or (pending_login.pending_action or "")
+
     password_value = message.text.strip()
     await _delete_sensitive_message(message)
     if _is_back_button(password_value):
         await state.update_data(rea_login=None, pending_action=None)
+        await asyncio.to_thread(_store().delete_pending_login, user_id)
         await show_action_menu(message, state)
         return
 
@@ -634,8 +719,7 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         password=password_value,
     )
 
-    data = await state.get_data()
-    pending_action = str(data.get("pending_action") or "").strip()
+    await asyncio.to_thread(_store().delete_pending_login, user_id)
     await state.update_data(pending_action=None)
     await state.set_state(RatingStates.waiting_for_action)
     start_initial_baseline_refresh(
@@ -760,6 +844,59 @@ async def handle_subject_without_state(message: Message, state: FSMContext) -> N
     logging.info("Received stateless subject query from user_id=%s", message.from_user.id if message.from_user else None)
     if message.text and message.text.startswith("/"):
         return
+    user_id = _telegram_user_id(message)
+    if user_id is not None and _get_credentials(user_id) is None:
+        pending_login = await asyncio.to_thread(_store().get_pending_login, user_id)
+        if pending_login is not None and not any(
+            [
+                _is_start_button(message.text),
+                _is_back_button(message.text),
+                _is_delete_data_request(message.text),
+                _is_notifications_request(message.text),
+                _is_rating_request(message.text),
+                _is_schedule_request(message.text),
+                _normalize_message_text(message.text) == _normalize_message_text(RATING_ACTION_TEXT),
+                _normalize_message_text(message.text) == _normalize_message_text(SCHEDULE_ACTION_TEXT),
+            ]
+        ):
+            if _looks_like_rea_login(message.text):
+                await state.update_data(
+                    rea_login=message.text.strip(),
+                    pending_action=pending_login.pending_action,
+                )
+                await asyncio.to_thread(
+                    _store().save_pending_login,
+                    telegram_user_id=user_id,
+                    rea_login=message.text.strip(),
+                    pending_action=pending_login.pending_action,
+                )
+                await state.set_state(RatingStates.waiting_for_password)
+                response = "Логин обновлен. Теперь введите пароль от личного кабинета РЭУ."
+                await _log_event(message, "rea_login", message_text=message.text, result_status="pending_login_updated_stateless", response_text=response)
+                await message.answer(response, reply_markup=_back_keyboard())
+                return
+
+            await state.update_data(
+                rea_login=pending_login.login,
+                pending_action=pending_login.pending_action,
+            )
+            await state.set_state(RatingStates.waiting_for_password)
+            await handle_password(message, state)
+            return
+
+        if pending_login is None and _looks_like_rea_login(message.text):
+            await state.update_data(rea_login=message.text.strip())
+            await asyncio.to_thread(
+                _store().save_pending_login,
+                telegram_user_id=user_id,
+                rea_login=message.text.strip(),
+            )
+            await state.set_state(RatingStates.waiting_for_password)
+            response = "Теперь введите пароль от личного кабинета РЭУ."
+            await _log_event(message, "rea_login", message_text=message.text, result_status="accepted_stateless", response_text=response)
+            await message.answer(response, reply_markup=_back_keyboard())
+            return
+
     if _is_start_button(message.text) or _is_back_button(message.text):
         await show_action_menu(message, state)
         return
@@ -1148,8 +1285,11 @@ async def refresh_initial_baseline_and_notify(
         telegram_user_id=telegram_user_id,
         event_type="initial_sync",
         result_status="completed",
-        response_text=f"source={source} {status}",
+        response_text=f"source={source} {status or 'no_user_message'}",
     )
+    if not status:
+        return
+
     await bot.send_message(
         chat_id=telegram_user_id,
         text=status,
@@ -1537,7 +1677,7 @@ async def save_schedule_baseline_if_available(
         )
 
 
-async def refresh_user_baselines_if_available(telegram_user_id: int, credentials) -> str:
+async def refresh_user_baselines_if_available(telegram_user_id: int, credentials) -> str | None:
     try:
         rating_html, schedule_html, schedule_error = await asyncio.to_thread(
             fetch_rating_and_schedule_html_once,
@@ -1557,7 +1697,7 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             result_status="baseline_refreshed",
             response_text=f"subjects={len(items)}",
         )
-        return "Текущий снимок обновлен, старые изменения не будут приходить задним числом."
+        return "Готово. Баллы и расписание загружены, теперь можно пользоваться ботом."
     except (RatingFetchError, RatingParseError) as exc:
         if _is_invalid_credentials_error(exc):
             await asyncio.to_thread(_store().delete_credentials, telegram_user_id)
@@ -1579,10 +1719,7 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             result_status="baseline_refresh_failed",
             error_message=str(exc),
         )
-        return (
-            "ЛКС РЭУ сейчас не ответил, поэтому баллы и расписание пока не загрузились. "
-            "Данные входа сохранены, я попробую обновить их при следующей проверке."
-        )
+        return None
 
 
 def format_schedule_change_notification(previous_text: str, current_text: str) -> str:
@@ -1705,13 +1842,23 @@ async def run_rating_monitor_cycle(bot: Bot, *, source: str) -> None:
     )
 
     user_delay = max(_env_float("MONITOR_USER_DELAY_SECONDS", 30.0), 0.0)
+    stop_on_transient_failure = _env_bool("MONITOR_STOP_ON_TRANSIENT_FAILURE", True)
     for index, credentials_item in enumerate(credentials):
-        await check_user_rating_and_schedule_changes(bot, credentials_item)
+        completed = await check_user_rating_and_schedule_changes(bot, credentials_item)
+        if not completed and stop_on_transient_failure:
+            await _log_store_event(
+                telegram_user_id=None,
+                event_type="rating_monitor",
+                result_status="cycle_stopped_after_transient_failure",
+                response_text=f"source={source} checked={index + 1} users={len(credentials)}",
+            )
+            break
+
         if user_delay and index < len(credentials) - 1:
             await asyncio.sleep(user_delay)
 
 
-async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCredentials) -> None:
+async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCredentials) -> bool:
     telegram_user_id = credentials.telegram_user_id
     try:
         rating_html, schedule_html, schedule_error = await asyncio.to_thread(
@@ -1736,7 +1883,7 @@ async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCr
                 error_message=str(exc),
                 response_text=response,
             )
-            return
+            return True
 
         await _log_store_event(
             telegram_user_id=telegram_user_id,
@@ -1750,7 +1897,7 @@ async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCr
             result_status="fetch_failed",
             error_message=str(exc),
         )
-        return
+        return False
     except Exception as exc:
         logging.exception("Monitor login failed for user_id=%s", telegram_user_id)
         await _log_store_event(
@@ -1765,7 +1912,7 @@ async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCr
             result_status="failed",
             error_message=str(exc),
         )
-        return
+        return False
 
     await process_user_rating_changes(bot, telegram_user_id, rating_html)
     if schedule_html is None:
@@ -1775,9 +1922,10 @@ async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCr
             result_status="fetch_failed",
             error_message=schedule_error or "Не удалось получить расписание.",
         )
-        return
+        return True
 
     await process_user_schedule_changes(bot, telegram_user_id, schedule_html)
+    return True
 
 
 async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str) -> None:

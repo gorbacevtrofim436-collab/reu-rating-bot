@@ -828,6 +828,14 @@ class UserStore:
                         """,
                         (telegram_user_id, rea_login, encrypted_password),
                     )
+                    cursor.execute(
+                        "DELETE FROM rating_snapshots WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
+                    cursor.execute(
+                        "DELETE FROM schedule_snapshots WHERE telegram_user_id = %s",
+                        (telegram_user_id,),
+                    )
             return
 
         with self._connect() as connection:
@@ -845,6 +853,14 @@ class UserStore:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (telegram_user_id, rea_login, encrypted_password),
+            )
+            connection.execute(
+                "DELETE FROM rating_snapshots WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            connection.execute(
+                "DELETE FROM schedule_snapshots WHERE telegram_user_id = ?",
+                (telegram_user_id,),
             )
 
     def get_schedule_snapshot(self, telegram_user_id: int) -> ScheduleSnapshot | None:

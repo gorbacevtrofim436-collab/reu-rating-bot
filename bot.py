@@ -141,6 +141,24 @@ def _env_bool(name: str, default: bool) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _env_float_list(name: str, default: tuple[float, ...]) -> list[float]:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return list(default)
+
+    result: list[float] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.append(max(float(item), 0.0))
+        except ValueError:
+            return list(default)
+
+    return result or list(default)
+
+
 async def _is_allowed(message: Message) -> bool:
     allowed_user_id = _allowed_user_id()
     if allowed_user_id is None:
@@ -1294,22 +1312,44 @@ async def refresh_initial_baseline_and_notify(
     credentials,
     source: str,
 ) -> None:
-    status = await refresh_user_baselines_if_available(telegram_user_id, credentials)
+    delays = _env_float_list("INITIAL_SYNC_RETRY_DELAYS_SECONDS", (0.0, 60.0, 300.0, 900.0))
+    for attempt, delay in enumerate(delays, start=1):
+        if delay:
+            await asyncio.sleep(delay)
+
+        if _get_credentials(telegram_user_id) is None:
+            await _log_store_event(
+                telegram_user_id=telegram_user_id,
+                event_type="initial_sync",
+                result_status="cancelled_no_credentials",
+                response_text=f"source={source} attempt={attempt}",
+            )
+            return
+
+        status = await refresh_user_baselines_if_available(telegram_user_id, credentials)
+        await _log_store_event(
+            telegram_user_id=telegram_user_id,
+            event_type="initial_sync",
+            result_status="completed" if status else "retry_scheduled",
+            response_text=f"source={source} attempt={attempt}/{len(delays)} {status or 'no_user_message'}",
+        )
+        if not status:
+            continue
+
+        await bot.send_message(
+            chat_id=telegram_user_id,
+            text=status,
+            reply_markup=_action_keyboard(telegram_user_id)
+            if _get_credentials(telegram_user_id) is not None
+            else _start_keyboard(),
+        )
+        return
+
     await _log_store_event(
         telegram_user_id=telegram_user_id,
         event_type="initial_sync",
-        result_status="completed",
-        response_text=f"source={source} {status or 'no_user_message'}",
-    )
-    if not status:
-        return
-
-    await bot.send_message(
-        chat_id=telegram_user_id,
-        text=status,
-        reply_markup=_action_keyboard(telegram_user_id)
-        if _get_credentials(telegram_user_id) is not None
-        else _start_keyboard(),
+        result_status="retry_exhausted",
+        response_text=f"source={source} attempts={len(delays)}",
     )
 
 
@@ -1473,7 +1513,7 @@ async def start_rating_flow(message: Message, state: FSMContext) -> None:
         source="rating_start_no_cache",
     )
     response = (
-        "Баллы еще загружаются из ЛКС. Я делаю это в фоне и напишу, когда данные будут готовы."
+        "Баллы еще загружаются. Я сам повторяю попытки в фоне и напишу, когда данные будут готовы."
     )
     await _log_event(
         message,
@@ -1556,7 +1596,7 @@ async def answer_subject(message: Message) -> None:
         credentials=credentials,
         source="subject_query_no_cache",
     )
-    response = "Баллы еще загружаются из ЛКС. Я напишу, когда данные будут готовы."
+    response = "Баллы еще загружаются. Я сам повторяю попытки в фоне и напишу, когда данные будут готовы."
     await _log_event(
         message,
         "subject_query",
@@ -1733,10 +1773,7 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             result_status="baseline_refresh_failed",
             error_message=str(exc),
         )
-        return (
-            "ЛКС РЭУ сейчас не отдал данные. Данные входа сохранены, "
-            "я повторю загрузку при следующей проверке. Попробуйте запросить баллы позже."
-        )
+        return None
     except Exception as exc:
         logging.exception("Initial baseline refresh failed for user_id=%s", telegram_user_id)
         await _log_store_event(
@@ -1745,10 +1782,7 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             result_status="baseline_refresh_failed",
             error_message=str(exc),
         )
-        return (
-            "Не удалось завершить первичную загрузку данных. Данные входа сохранены, "
-            "я повторю загрузку при следующей проверке."
-        )
+        return None
 
 
 def format_schedule_change_notification(previous_text: str, current_text: str) -> str:
@@ -1965,6 +1999,12 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
 
         if not previous:
             await save_rating_items_cache(telegram_user_id, items)
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    chat_id=telegram_user_id,
+                    text="Готово. Баллы загружены, теперь можно пользоваться ботом.",
+                    reply_markup=_action_keyboard(telegram_user_id),
+                )
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="rating_monitor",

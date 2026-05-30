@@ -33,11 +33,11 @@ jobs:
           MONITOR_STOP_ON_TRANSIENT_FAILURE: "false"
           REA_RATING_URL: https://student.rea.ru/rating/index.php?login=yes&semester=2-й+семестр
           REA_LOGIN_URL: https://student.rea.ru/
-          REA_REQUEST_TIMEOUT: "10"
+          REA_REQUEST_TIMEOUT: "25"
           REA_HTTP_RETRIES: "0"
           REA_HTTP_CONNECT_RETRIES: "0"
           REA_HTTP_READ_RETRIES: "0"
           REA_HTTP_STATUS_RETRIES: "0"
           REA_LESSONS_URL: https://student.rea.ru/lessons/index.php?login=yes
-          REA_SCHEDULE_REQUEST_TIMEOUT: "10"
+          REA_SCHEDULE_REQUEST_TIMEOUT: "25"
         run: python bot.py

@@ -2238,11 +2238,26 @@ async def run_polling() -> None:
         await bot.session.close()
 
 
+async def run_monitor_once() -> None:
+    global store
+    store = UserStore()
+    _warm_runtime_caches()
+    bot = Bot(token=get_bot_token())
+    try:
+        await run_rating_monitor_cycle(bot, source=os.getenv("MONITOR_SOURCE", "cli"))
+    finally:
+        await bot.session.close()
+
+
 def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO)
 
     run_mode = os.getenv("RUN_MODE", "webhook").strip().casefold()
+    if run_mode == "monitor_once":
+        asyncio.run(run_monitor_once())
+        return
+
     if run_mode == "polling":
         asyncio.run(run_polling())
         return

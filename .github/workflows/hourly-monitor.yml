@@ -8,18 +8,36 @@ on:
 jobs:
   trigger-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
-      - name: Trigger Render monitor endpoint
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor once
         env:
-          MONITOR_RUN_URL: ${{ secrets.MONITOR_RUN_URL }}
-          MONITOR_RUN_SECRET: ${{ secrets.MONITOR_RUN_SECRET }}
-        run: |
-          test -n "$MONITOR_RUN_URL"
-          test -n "$MONITOR_RUN_SECRET"
-          curl --fail --show-error --silent \
-            --max-time 60 \
-            --retry 2 \
-            --retry-delay 10 \
-            -X POST "$MONITOR_RUN_URL" \
-            -H "X-Monitor-Secret: $MONITOR_RUN_SECRET"
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          BOT_CREDENTIAL_KEY: ${{ secrets.BOT_CREDENTIAL_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RUN_MODE: monitor_once
+          MONITOR_SOURCE: github
+          MONITOR_USER_DELAY_SECONDS: "120"
+          MONITOR_STOP_ON_TRANSIENT_FAILURE: "false"
+          REA_RATING_URL: https://student.rea.ru/rating/index.php?login=yes&semester=2-й+семестр
+          REA_LOGIN_URL: https://student.rea.ru/
+          REA_REQUEST_TIMEOUT: "10"
+          REA_HTTP_RETRIES: "0"
+          REA_HTTP_CONNECT_RETRIES: "0"
+          REA_HTTP_READ_RETRIES: "0"
+          REA_HTTP_STATUS_RETRIES: "0"
+          REA_LESSONS_URL: https://student.rea.ru/lessons/index.php?login=yes
+          REA_SCHEDULE_REQUEST_TIMEOUT: "10"
+        run: python bot.py

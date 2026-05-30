@@ -49,7 +49,9 @@ MONITOR_INTERVAL_SECONDS=3600
 MONITOR_USER_DELAY_SECONDS=120
 MONITOR_STOP_ON_TRANSIENT_FAILURE=true
 INTERACTIVE_REFRESH_COOLDOWN_SECONDS=21600
-INITIAL_SYNC_RETRY_DELAYS_SECONDS=0,60,300,900,1800
+INITIAL_SYNC_RETRY_DELAYS_SECONDS=0,20,40
+INITIAL_SYNC_DEADLINE_SECONDS=60
+INITIAL_SYNC_ATTEMPT_TIMEOUT_SECONDS=25
 ```
 
 Настройки РЭУ:
@@ -124,7 +126,9 @@ MONITOR_RUN_SECRET=случайная_строка
 MONITOR_USER_DELAY_SECONDS=120
 MONITOR_STOP_ON_TRANSIENT_FAILURE=true
 INTERACTIVE_REFRESH_COOLDOWN_SECONDS=21600
-INITIAL_SYNC_RETRY_DELAYS_SECONDS=0,60,300,900,1800
+INITIAL_SYNC_RETRY_DELAYS_SECONDS=0,20,40
+INITIAL_SYNC_DEADLINE_SECONDS=60
+INITIAL_SYNC_ATTEMPT_TIMEOUT_SECONDS=25
 REA_RATING_URL=https://student.rea.ru/rating/index.php?login=yes&semester=2-й+семестр
 REA_LOGIN_URL=https://student.rea.ru/
 REA_REQUEST_TIMEOUT=25
@@ -332,7 +336,8 @@ ORDER BY updated_at DESC;
 
 - `/start` — показать приветствие и меню выбора действия.
 - `/login` — сменить логин и пароль ЛКС.
-- `/logout` — удалить данные входа, настройки уведомлений, снимки баллов и снимок расписания.
+- `/logout` — выйти из аккаунта и удалить данные входа, настройки уведомлений, снимки баллов и снимок расписания.
 - `/schedule` или сообщение `расписание` — открыть выбор дня текущей недели.
+- `/check` — проверить ЛКС снова, если данные еще не загрузились.
 
-В обычном сценарии пользователь работает кнопками: `Баллы`, `Расписание пар`, `Включить уведомления об изменениях` / `Выключить уведомления об изменениях`, `Удалить данные`, `Назад`. Для рейтинга бот показывает полные названия предметов, но короткие варианты вроде `матан`, `англ`, `алгоритмы` по-прежнему понимает при ручном вводе.
+В обычном сценарии пользователь работает кнопками: `Баллы`, `Расписание пар`, `Проверить снова`, `Включить уведомления об изменениях` / `Выключить уведомления об изменениях`, `Выйти из аккаунта`, `Назад`. Для рейтинга бот показывает полные названия предметов, но короткие варианты вроде `матан`, `англ`, `алгоритмы` по-прежнему понимает при ручном вводе.

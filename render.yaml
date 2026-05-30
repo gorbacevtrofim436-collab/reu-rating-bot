@@ -30,7 +30,11 @@ services:
       - key: INTERACTIVE_REFRESH_COOLDOWN_SECONDS
         value: 21600
       - key: INITIAL_SYNC_RETRY_DELAYS_SECONDS
-        value: 0,60,300,900,1800
+        value: 0,20,40
+      - key: INITIAL_SYNC_DEADLINE_SECONDS
+        value: 60
+      - key: INITIAL_SYNC_ATTEMPT_TIMEOUT_SECONDS
+        value: 25
       - key: BOT_TOKEN
         sync: false
       - key: BOT_CREDENTIAL_KEY

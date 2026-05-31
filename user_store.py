@@ -192,6 +192,7 @@ class UserStore:
             return
 
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS rea_credentials (

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run REU rating monitor hourly
+
+[Timer]
+OnBootSec=5min
+OnCalendar=hourly
+RandomizedDelaySec=3min
+Persistent=true
+Unit=reu-rating-monitor.service
+
+[Install]
+WantedBy=timers.target

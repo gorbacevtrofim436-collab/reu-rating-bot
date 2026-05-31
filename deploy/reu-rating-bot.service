@@ -1,0 +1,18 @@
+[Unit]
+Description=REU Rating Telegram Bot Polling
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=reubot
+Group=reubot
+WorkingDirectory=/opt/reu-rating-bot/app
+EnvironmentFile=/etc/reu-rating-bot.env
+ExecStart=/opt/reu-rating-bot/.venv/bin/python /opt/reu-rating-bot/app/bot.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

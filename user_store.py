@@ -189,6 +189,23 @@ class UserStore:
                         ADD COLUMN IF NOT EXISTS schedule_key TEXT
                         """
                     )
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS bot_subscribers (
+                            telegram_user_id BIGINT PRIMARY KEY,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO bot_subscribers (telegram_user_id)
+                        SELECT telegram_user_id
+                        FROM rea_credentials
+                        ON CONFLICT(telegram_user_id) DO NOTHING
+                        """
+                    )
             return
 
         with self._connect() as connection:
@@ -290,6 +307,72 @@ class UserStore:
             }
             if "schedule_key" not in columns:
                 connection.execute("ALTER TABLE schedule_snapshots ADD COLUMN schedule_key TEXT")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_subscribers (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO bot_subscribers (telegram_user_id)
+                SELECT telegram_user_id
+                FROM rea_credentials
+                """
+            )
+
+    def subscribe_user(self, telegram_user_id: int) -> None:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO bot_subscribers (telegram_user_id)
+                        VALUES (%s)
+                        ON CONFLICT(telegram_user_id) DO UPDATE SET
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (telegram_user_id,),
+                    )
+            return
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO bot_subscribers (telegram_user_id)
+                VALUES (?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (telegram_user_id,),
+            )
+
+    def list_subscriber_ids(self) -> list[int]:
+        if self.use_postgres:
+            with self._pg_connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT telegram_user_id
+                        FROM bot_subscribers
+                        ORDER BY created_at ASC
+                        """
+                    )
+                    rows = cursor.fetchall()
+        else:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT telegram_user_id
+                    FROM bot_subscribers
+                    ORDER BY created_at ASC
+                    """
+                ).fetchall()
+
+        return [int(row[0]) for row in rows]
 
     def log_event(
         self,

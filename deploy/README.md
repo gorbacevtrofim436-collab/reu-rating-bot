@@ -12,10 +12,18 @@ configuration uses:
 RUN_MODE=polling
 BOT_DB_PATH=/opt/reu-rating-bot/data/credentials.sqlite3
 DATABASE_URL=
+BOT_ADMIN_USER_ID=your_telegram_id
 ```
 
 Keep `BOT_TOKEN`, `BOT_CREDENTIAL_KEY` and the remaining project settings in
 the same protected file.
+
+The administrator can send an announcement to every user who has pressed
+`/start` at least once:
+
+```text
+/broadcast
+```
 
 ## Services
 

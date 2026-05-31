@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -50,6 +51,8 @@ class RatingStates(StatesGroup):
     waiting_for_subject = State()
     waiting_for_schedule_day = State()
     confirming_delete_data = State()
+    waiting_for_broadcast_text = State()
+    confirming_broadcast = State()
 
 
 store: UserStore | None = None
@@ -82,6 +85,9 @@ CHECK_AGAIN_TEXT = "Проверить снова"
 CONFIRM_DELETE_TEXT = "Да, удалить"
 NOTIFICATIONS_ENABLE_TEXT = "Включить уведомления об изменениях"
 NOTIFICATIONS_DISABLE_TEXT = "Выключить уведомления об изменениях"
+BROADCAST_CONFIRM_TEXT = "Отправить всем"
+BROADCAST_CANCEL_TEXT = "Отмена"
+BROADCAST_TEXT_LIMIT = 3500
 NOTIFICATION_TRIGGER_TEXTS = {
     "уведомления",
     "включить уведомления",
@@ -113,6 +119,10 @@ BOT_SHORT_DESCRIPTION = "Баллы, расписание и уведомлен�
 def _allowed_user_id() -> int | None:
     value = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
     return int(value) if value else None
+
+
+def _admin_user_id() -> int | None:
+    return _env_int("BOT_ADMIN_USER_ID")
 
 
 def _env_int(name: str) -> int | None:
@@ -165,6 +175,11 @@ async def _is_allowed(message: Message) -> bool:
     if allowed_user_id is None:
         return True
     return bool(message.from_user and message.from_user.id == allowed_user_id)
+
+
+def _is_admin(message: Message) -> bool:
+    admin_user_id = _admin_user_id()
+    return bool(admin_user_id is not None and _telegram_user_id(message) == admin_user_id)
 
 
 def _store() -> UserStore:
@@ -385,6 +400,17 @@ def _confirm_delete_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _confirm_broadcast_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BROADCAST_CONFIRM_TEXT)],
+            [KeyboardButton(text=BROADCAST_CANCEL_TEXT)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def _back_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=BACK_BUTTON_TEXT)]],
@@ -492,6 +518,11 @@ async def start(message: Message, state: FSMContext) -> None:
         await message.answer(response)
         return
 
+    try:
+        await asyncio.to_thread(_store().subscribe_user, user_id)
+    except Exception:
+        logging.exception("Could not subscribe Telegram user_id=%s", user_id)
+
     await state.clear()
     credentials = _get_credentials(user_id)
     if credentials is not None:
@@ -586,6 +617,125 @@ async def cancel(message: Message, state: FSMContext) -> None:
     await _log_event(message, "command", message_text="/cancel", result_status="cancelled", response_text=response)
     await message.answer(response)
     await show_action_menu(message, state)
+
+
+@router.message(Command("broadcast"))
+async def broadcast(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        return
+
+    await state.clear()
+    await state.set_state(RatingStates.waiting_for_broadcast_text)
+    response = "Введите текст объявления для всех пользователей бота."
+    await _log_event(
+        message,
+        "broadcast",
+        message_text="/broadcast",
+        result_status="text_requested",
+        response_text=response,
+    )
+    await message.answer(response, reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(RatingStates.waiting_for_broadcast_text, F.text)
+async def handle_broadcast_text(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        return
+
+    broadcast_text = message.text.strip()
+    if not broadcast_text or broadcast_text.startswith("/"):
+        await message.answer("Введите текст объявления или используйте /cancel.")
+        return
+    if len(broadcast_text) > BROADCAST_TEXT_LIMIT:
+        await message.answer(
+            f"Сообщение слишком длинное. Максимум: {BROADCAST_TEXT_LIMIT} символов."
+        )
+        return
+
+    subscriber_ids = await asyncio.to_thread(_store().list_subscriber_ids)
+    await state.update_data(broadcast_text=broadcast_text)
+    await state.set_state(RatingStates.confirming_broadcast)
+    response = (
+        "Предпросмотр объявления:\n\n"
+        f"{broadcast_text}\n\n"
+        f"Получателей: {len(subscriber_ids)}"
+    )
+    await _log_event(
+        message,
+        "broadcast",
+        result_status="confirmation_requested",
+        response_text=f"recipients={len(subscriber_ids)}",
+    )
+    await message.answer(response, reply_markup=_confirm_broadcast_keyboard())
+
+
+@router.message(RatingStates.confirming_broadcast, F.text)
+async def handle_broadcast_confirmation(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        return
+
+    normalized_text = _normalize_message_text(message.text)
+    if normalized_text == _normalize_message_text(BROADCAST_CANCEL_TEXT):
+        await state.clear()
+        response = "Рассылка отменена."
+        await _log_event(message, "broadcast", result_status="cancelled", response_text=response)
+        await message.answer(response, reply_markup=_action_keyboard(_telegram_user_id(message)))
+        return
+
+    if normalized_text != _normalize_message_text(BROADCAST_CONFIRM_TEXT):
+        await message.answer(
+            "Подтвердите рассылку кнопкой ниже или отмените её.",
+            reply_markup=_confirm_broadcast_keyboard(),
+        )
+        return
+
+    data = await state.get_data()
+    broadcast_text = str(data.get("broadcast_text") or "").strip()
+    await state.clear()
+    if not broadcast_text:
+        await message.answer(
+            "Текст объявления потерян. Запустите /broadcast заново.",
+            reply_markup=_action_keyboard(_telegram_user_id(message)),
+        )
+        return
+
+    subscriber_ids = await asyncio.to_thread(_store().list_subscriber_ids)
+    await message.answer(
+        f"Начинаю рассылку. Получателей: {len(subscriber_ids)}.",
+        reply_markup=_action_keyboard(_telegram_user_id(message)),
+    )
+    delivered = 0
+    failed = 0
+    delay = max(_env_float("BROADCAST_USER_DELAY_SECONDS", 0.1), 0.0)
+    for index, subscriber_id in enumerate(subscriber_ids):
+        try:
+            await message.bot.send_message(chat_id=subscriber_id, text=broadcast_text)
+            delivered += 1
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.2)
+            try:
+                await message.bot.send_message(chat_id=subscriber_id, text=broadcast_text)
+                delivered += 1
+            except Exception:
+                failed += 1
+                logging.exception("Broadcast retry failed for user_id=%s", subscriber_id)
+        except Exception:
+            failed += 1
+            logging.exception("Broadcast failed for user_id=%s", subscriber_id)
+
+        if delay and index < len(subscriber_ids) - 1:
+            await asyncio.sleep(delay)
+
+    response = f"Рассылка завершена. Доставлено: {delivered}. Ошибок: {failed}."
+    await _log_event(
+        message,
+        "broadcast",
+        result_status="completed",
+        response_text=f"recipients={len(subscriber_ids)} delivered={delivered} failed={failed}",
+    )
+    await message.answer(response, reply_markup=_action_keyboard(_telegram_user_id(message)))
 
 
 @router.message(RatingStates.waiting_for_action, F.text)

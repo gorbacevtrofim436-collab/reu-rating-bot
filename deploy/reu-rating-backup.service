@@ -1,0 +1,9 @@
+[Unit]
+Description=REU Rating Bot SQLite backup
+
+[Service]
+Type=oneshot
+User=reubot
+Group=reubot
+WorkingDirectory=/opt/reu-rating-bot/app
+ExecStart=/usr/bin/python3 /opt/reu-rating-bot/app/deploy/backup_sqlite.py

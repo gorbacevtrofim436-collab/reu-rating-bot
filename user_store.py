@@ -65,10 +65,16 @@ class UserStore:
             raise UserStoreError("BOT_CREDENTIAL_KEY не задан в .env")
 
         self.cipher = Fernet(key.encode("utf-8"))
-        self._init_db()
+        if os.getenv("BOT_SKIP_DB_INIT", "").strip().casefold() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        return sqlite3.connect(self.db_path, timeout=10.0)
 
     def _pg_connect(self):
         try:
@@ -76,7 +82,11 @@ class UserStore:
         except ImportError as exc:
             raise UserStoreError("Для DATABASE_URL нужен пакет psycopg.") from exc
 
-        return psycopg.connect(self.database_url)
+        return psycopg.connect(
+            self.database_url,
+            autocommit=True,
+            connect_timeout=5,
+        )
 
     def _init_db(self) -> None:
         if self.use_postgres:
@@ -903,11 +913,24 @@ class UserStore:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
-                        SELECT telegram_user_id, schedule_hash, schedule_text, schedule_key
+                        SELECT telegram_user_id
                         FROM schedule_snapshots
                         """
                     )
-                    rows = cursor.fetchall()
+                    telegram_user_ids = [int(row[0]) for row in cursor.fetchall()]
+                    rows = []
+                    for telegram_user_id in telegram_user_ids:
+                        cursor.execute(
+                            """
+                            SELECT telegram_user_id, schedule_hash, schedule_text, schedule_key
+                            FROM schedule_snapshots
+                            WHERE telegram_user_id = %s
+                            """,
+                            (telegram_user_id,),
+                        )
+                        row = cursor.fetchone()
+                        if row is not None:
+                            rows.append(row)
         else:
             with self._connect() as connection:
                 rows = connection.execute(

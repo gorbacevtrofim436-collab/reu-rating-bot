@@ -1,0 +1,10 @@
+[Unit]
+Description=Run REU Rating Bot SQLite backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=reu-rating-backup.service
+
+[Install]
+WantedBy=timers.target

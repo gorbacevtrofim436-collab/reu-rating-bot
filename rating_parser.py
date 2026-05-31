@@ -159,16 +159,18 @@ def find_subject_score(items: Iterable[RatingItem], query: str) -> RatingItem | 
     if len(contains_matches) == 1:
         return contains_matches[0]
 
-    best_item: RatingItem | None = None
-    best_ratio = 0.0
+    ranked: list[tuple[float, RatingItem]] = []
     for item in candidates:
         ratio = SequenceMatcher(
             None,
             normalized_query,
             normalize_text(item.subject),
         ).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_item = item
+        ranked.append((ratio, item))
 
-    return best_item if best_ratio >= 0.65 else None
+    ranked.sort(key=lambda value: value[0], reverse=True)
+    if not ranked or ranked[0][0] < 0.65:
+        return None
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.08:
+        return None
+    return ranked[0][1]

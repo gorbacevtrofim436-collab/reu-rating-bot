@@ -3,25 +3,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import hmac
 import logging
 import os
-import random
 import time
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BotCommand, FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
 from dotenv import load_dotenv
 
-from rating_client import RatingClient, RatingFetchError, ReaCaptchaRequired, create_rea_session
+from rating_client import InvalidCredentialsError, RatingClient, RatingFetchError, ReaCaptchaRequired, create_rea_session
 from rating_parser import (
     RatingItem,
     RatingParseError,
@@ -56,11 +54,7 @@ class RatingStates(StatesGroup):
 
 
 store: UserStore | None = None
-rating_cache_refresh_tasks: dict[int, asyncio.Task] = {}
-schedule_cache_refresh_tasks: dict[int, asyncio.Task] = {}
 initial_baseline_refresh_tasks: dict[int, asyncio.Task] = {}
-rating_cache_refresh_started_at: dict[int, float] = {}
-schedule_cache_refresh_started_at: dict[int, float] = {}
 notification_settings_cache: dict[int, bool] = {}
 credentials_cache: dict[int, StoredCredentials] = {}
 rating_items_cache: dict[int, list[RatingItem]] = {}
@@ -81,10 +75,13 @@ RATING_ACTION_TEXT = "Баллы"
 SCHEDULE_ACTION_TEXT = "Расписание пар"
 BACK_BUTTON_TEXT = "Назад"
 DELETE_DATA_TEXT = "Выйти из аккаунта"
+DELETE_ALL_DATA_TEXT = "Удалить все мои данные"
 CHECK_AGAIN_TEXT = "Проверить снова"
 CONFIRM_DELETE_TEXT = "Да, удалить"
 NOTIFICATIONS_ENABLE_TEXT = "Включить уведомления об изменениях"
 NOTIFICATIONS_DISABLE_TEXT = "Выключить уведомления об изменениях"
+ANNOUNCEMENTS_ENABLE_TEXT = "Включить объявления"
+ANNOUNCEMENTS_DISABLE_TEXT = "Отключить объявления"
 BROADCAST_CONFIRM_TEXT = "Отправить всем"
 BROADCAST_CANCEL_TEXT = "Отмена"
 BROADCAST_TEXT_LIMIT = 3500
@@ -114,6 +111,11 @@ BOT_DESCRIPTION = (
     "и предупредит, если изменятся баллы или пары. Один вход — дальше все под рукой."
 )
 BOT_SHORT_DESCRIPTION = "Баллы, расписание и уведомления РЭУ"
+LOGIN_PROMPT = (
+    "Введите логин от личного кабинета РЭУ.\n\n"
+    "Продолжая вход, вы соглашаетесь сохранить данные ЛКС в зашифрованном виде "
+    "для загрузки баллов и расписания. Удалить их можно кнопкой «Выйти из аккаунта»."
+)
 
 
 def _allowed_user_id() -> int | None:
@@ -194,12 +196,6 @@ def _warm_runtime_caches() -> None:
     schedule_snapshot_cache.clear()
     notification_settings_cache.clear()
 
-    credentials_cache.update(
-        {
-            credentials.telegram_user_id: credentials
-            for credentials in _store().list_credentials()
-        }
-    )
     rating_items_cache.update(
         {
             telegram_user_id: rating_snapshots_to_items(snapshots)
@@ -208,6 +204,7 @@ def _warm_runtime_caches() -> None:
     )
     schedule_snapshot_cache.update(_store().list_schedule_snapshots())
     notification_settings_cache.update(_store().list_notification_settings())
+    _store().prune_old_events(_env_int("BOT_EVENT_RETENTION_DAYS") or 90)
 
 
 def _get_credentials(telegram_user_id: int):
@@ -230,10 +227,6 @@ def _forget_user_runtime_data(telegram_user_id: int) -> None:
     credentials_cache.pop(telegram_user_id, None)
     rating_items_cache.pop(telegram_user_id, None)
     schedule_snapshot_cache.pop(telegram_user_id, None)
-    rating_cache_refresh_started_at.pop(telegram_user_id, None)
-    schedule_cache_refresh_started_at.pop(telegram_user_id, None)
-    _cancel_user_task(rating_cache_refresh_tasks, telegram_user_id)
-    _cancel_user_task(schedule_cache_refresh_tasks, telegram_user_id)
     _cancel_user_task(initial_baseline_refresh_tasks, telegram_user_id)
 
 
@@ -252,7 +245,7 @@ def _cancel_user_task(tasks: dict[int, asyncio.Task], telegram_user_id: int) -> 
 
 
 def _is_invalid_credentials_error(exc: Exception) -> bool:
-    return "не принял логин или пароль" in str(exc).casefold()
+    return isinstance(exc, InvalidCredentialsError)
 
 
 def _looks_like_rea_login(value: str | None) -> bool:
@@ -263,35 +256,19 @@ def _looks_like_rea_login(value: str | None) -> bool:
         return False
     if _is_rating_request(normalized) or _is_schedule_request(normalized):
         return False
-    if _is_notifications_request(normalized) or _is_delete_data_request(normalized) or _is_check_again_request(normalized):
+    if (
+        _is_notifications_request(normalized)
+        or _is_announcements_request(normalized)
+        or _is_delete_data_request(normalized)
+        or _is_delete_all_data_request(normalized)
+        or _is_check_again_request(normalized)
+    ):
         return False
     return "." in normalized and len(normalized) <= 80
 
 
-def _interactive_refresh_allowed(
-    started_at: dict[int, float],
-    telegram_user_id: int,
-) -> bool:
-    cooldown = max(_env_float("INTERACTIVE_REFRESH_COOLDOWN_SECONDS", 1800.0), 0.0)
-    now = time.monotonic()
-    last_started_at = started_at.get(telegram_user_id)
-    if last_started_at is not None and now - last_started_at < cooldown:
-        return False
-
-    started_at[telegram_user_id] = now
-    return True
-
-
 def _telegram_user_id(message: Message) -> int | None:
     return message.from_user.id if message.from_user else None
-
-
-def _store_backend_label() -> str:
-    current_store = _store()
-    if current_store.use_postgres:
-        host = urlparse(current_store.database_url).hostname or "unknown"
-        return f"postgres:{host}"
-    return f"sqlite:{current_store.db_path}"
 
 
 def _normalize_message_text(value: str | None) -> str:
@@ -321,6 +298,10 @@ def _is_delete_data_request(value: str | None) -> bool:
     }
 
 
+def _is_delete_all_data_request(value: str | None) -> bool:
+    return _normalize_message_text(value) == _normalize_message_text(DELETE_ALL_DATA_TEXT)
+
+
 def _is_check_again_request(value: str | None) -> bool:
     return _normalize_message_text(value) == _normalize_message_text(CHECK_AGAIN_TEXT)
 
@@ -331,6 +312,13 @@ def _is_confirm_delete_request(value: str | None) -> bool:
 
 def _is_notifications_request(value: str | None) -> bool:
     return _normalize_message_text(value) in {_normalize_message_text(text) for text in NOTIFICATION_TRIGGER_TEXTS}
+
+
+def _is_announcements_request(value: str | None) -> bool:
+    return _normalize_message_text(value) in {
+        _normalize_message_text(ANNOUNCEMENTS_ENABLE_TEXT),
+        _normalize_message_text(ANNOUNCEMENTS_DISABLE_TEXT),
+    }
 
 
 def _is_full_schedule_request(value: str | None) -> bool:
@@ -355,12 +343,22 @@ def _action_keyboard(telegram_user_id: int | None = None) -> ReplyKeyboardMarkup
             else NOTIFICATIONS_ENABLE_TEXT
         )
 
+    announcements_text = ANNOUNCEMENTS_DISABLE_TEXT
+    if telegram_user_id is not None:
+        announcements_text = (
+            ANNOUNCEMENTS_DISABLE_TEXT
+            if _store().announcements_enabled(telegram_user_id)
+            else ANNOUNCEMENTS_ENABLE_TEXT
+        )
+
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=RATING_ACTION_TEXT), KeyboardButton(text=SCHEDULE_ACTION_TEXT)],
             [KeyboardButton(text=notifications_text)],
+            [KeyboardButton(text=announcements_text)],
             [KeyboardButton(text=CHECK_AGAIN_TEXT)],
             [KeyboardButton(text=DELETE_DATA_TEXT)],
+            [KeyboardButton(text=DELETE_ALL_DATA_TEXT)],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -435,11 +433,30 @@ def _welcome_caption() -> str:
     )
 
 
-async def _delete_sensitive_message(message: Message) -> None:
+def _mask_login(value: str) -> str:
+    value = value.strip()
+    if len(value) <= 3:
+        return "***"
+    return f"{value[:2]}***{value[-1:]}"
+
+
+def _format_updated_at(value: str | None) -> str:
+    if not value:
+        return "время обновления неизвестно"
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local = parsed.astimezone(ZoneInfo("Europe/Moscow"))
+    return local.strftime("%d.%m.%Y %H:%M МСК")
+
+
+async def _delete_sensitive_message(message: Message) -> bool:
     try:
         await message.delete()
+        return True
     except Exception:
         logging.info("Could not delete sensitive message from user_id=%s", _telegram_user_id(message))
+        return False
 
 
 async def _log_event(
@@ -567,7 +584,7 @@ async def login(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await state.set_state(RatingStates.waiting_for_login)
-    response = "Введите логин от личного кабинета РЭУ."
+    response = LOGIN_PROMPT
     await _log_event(message, "command", message_text="/login", result_status="login_required", response_text=response)
     await message.answer(response, reply_markup=_back_keyboard())
 
@@ -617,6 +634,37 @@ async def cancel(message: Message, state: FSMContext) -> None:
     await _log_event(message, "command", message_text="/cancel", result_status="cancelled", response_text=response)
     await message.answer(response)
     await show_action_menu(message, state)
+
+
+@router.message(Command("help"))
+async def help_command(message: Message, state: FSMContext) -> None:
+    response = (
+        "Бот показывает сохраненные баллы и расписание сразу, а ЛКС проверяет отдельно примерно раз в час.\n\n"
+        "Кнопка «Проверить снова» запускает дополнительное обновление. "
+        "Пароль хранится на сервере в зашифрованном виде. "
+        "Чтобы удалить только вход в ЛКС, нажмите «Выйти из аккаунта». "
+        "Чтобы удалить также историю и подписку на объявления, нажмите «Удалить все мои данные»."
+    )
+    await _log_event(message, "help", result_status="shown", response_text=response)
+    await message.answer(response, reply_markup=_action_keyboard(_telegram_user_id(message)))
+    await state.set_state(RatingStates.waiting_for_action)
+
+
+@router.message(Command("admin"))
+async def admin_status(message: Message) -> None:
+    if not _is_admin(message):
+        return
+    stats = await asyncio.to_thread(_store().admin_stats)
+    response = (
+        "Статус бота:\n"
+        f"Авторизованных пользователей: {stats['authorized_users']}\n"
+        f"Получателей объявлений: {stats['active_subscribers']}\n"
+        f"Ожидают загрузки ЛКС: {stats['pending_sync_jobs']}\n"
+        f"Ожидают доставки уведомления: {stats['pending_notifications']}\n"
+        f"Последний монитор: {_format_updated_at(stats['latest_monitor_at'])}\n"
+        f"Результат: {stats['latest_monitor_status'] or '-'}"
+    )
+    await message.answer(response)
 
 
 @router.message(Command("broadcast"))
@@ -713,6 +761,9 @@ async def handle_broadcast_confirmation(message: Message, state: FSMContext) -> 
         try:
             await message.bot.send_message(chat_id=subscriber_id, text=broadcast_text)
             delivered += 1
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            failed += 1
+            await asyncio.to_thread(_store().deactivate_subscriber, subscriber_id, str(exc))
         except TelegramRetryAfter as exc:
             await asyncio.sleep(float(exc.retry_after) + 0.2)
             try:
@@ -744,13 +795,19 @@ async def handle_action_choice(message: Message, state: FSMContext) -> None:
         await show_action_menu(message, state)
         return
     if _is_delete_data_request(message.text):
-        await ask_delete_data_confirmation(message, state)
+        await ask_delete_data_confirmation(message, state, delete_all=False)
+        return
+    if _is_delete_all_data_request(message.text):
+        await ask_delete_data_confirmation(message, state, delete_all=True)
         return
     if _is_check_again_request(message.text):
         await check_again(message, state)
         return
     if _is_notifications_request(message.text):
         await toggle_notifications(message, state)
+        return
+    if _is_announcements_request(message.text):
+        await toggle_announcements(message, state)
         return
     if _is_rating_request(message.text) or _normalize_message_text(message.text) == _normalize_message_text(RATING_ACTION_TEXT):
         await start_rating_flow(message, state)
@@ -776,7 +833,7 @@ async def handle_action_choice(message: Message, state: FSMContext) -> None:
                 )
                 await state.set_state(RatingStates.waiting_for_password)
                 response = "Логин обновлен. Теперь введите пароль от личного кабинета РЭУ."
-                await _log_event(message, "rea_login", message_text=message.text, result_status="pending_login_updated", response_text=response)
+                await _log_event(message, "rea_login", message_text=_mask_login(message.text), result_status="pending_login_updated", response_text=response)
                 await message.answer(response, reply_markup=_back_keyboard())
                 return
 
@@ -797,7 +854,7 @@ async def handle_action_choice(message: Message, state: FSMContext) -> None:
             )
             await state.set_state(RatingStates.waiting_for_password)
             response = "Теперь введите пароль от личного кабинета РЭУ."
-            await _log_event(message, "rea_login", message_text=message.text, result_status="accepted_from_menu", response_text=response)
+            await _log_event(message, "rea_login", message_text=_mask_login(message.text), result_status="accepted_from_menu", response_text=response)
             await message.answer(response, reply_markup=_back_keyboard())
             return
 
@@ -836,8 +893,8 @@ async def handle_login(message: Message, state: FSMContext) -> None:
         return
 
     if not login_value or login_value.startswith("/"):
-        response = "Введите логин от личного кабинета РЭУ."
-        await _log_event(message, "rea_login", message_text=login_value, result_status="invalid", response_text=response)
+        response = LOGIN_PROMPT
+        await _log_event(message, "rea_login", message_text=_mask_login(login_value), result_status="invalid", response_text=response)
         await message.answer(response, reply_markup=_back_keyboard())
         return
 
@@ -854,7 +911,7 @@ async def handle_login(message: Message, state: FSMContext) -> None:
     await state.update_data(rea_login=login_value)
     await state.set_state(RatingStates.waiting_for_password)
     response = "Теперь введите пароль от личного кабинета РЭУ."
-    await _log_event(message, "rea_login", message_text=login_value, result_status="accepted", response_text=response)
+    await _log_event(message, "rea_login", message_text=_mask_login(login_value), result_status="accepted", response_text=response)
     await message.answer(response, reply_markup=_back_keyboard())
 
 
@@ -884,7 +941,7 @@ async def handle_password(message: Message, state: FSMContext) -> None:
             pending_action = pending_action or (pending_login.pending_action or "")
 
     password_value = message.text.strip()
-    await _delete_sensitive_message(message)
+    password_deleted = await _delete_sensitive_message(message)
     if _is_back_button(password_value):
         await state.update_data(rea_login=None, pending_action=None)
         await asyncio.to_thread(_store().delete_pending_login, user_id)
@@ -936,8 +993,13 @@ async def handle_password(message: Message, state: FSMContext) -> None:
         "Аккаунт подключен. Загружаю баллы и расписание, обычно это занимает до минуты.\n"
         "Если ЛКС не примет логин или пароль, данные будут удалены."
     )
-    await _log_event(message, "rea_login_result", message_text=login_value, result_status="saved_pending", response_text=response)
+    await _log_event(message, "rea_login_result", message_text=_mask_login(login_value), result_status="saved_pending", response_text=response)
     await message.answer(response, reply_markup=_action_keyboard(user_id))
+    if not password_deleted:
+        await message.answer(
+            "Telegram не позволил удалить сообщение с паролем автоматически. "
+            "Удалите свое предыдущее сообщение вручную."
+        )
 
 
 @router.message(RatingStates.waiting_for_schedule_day, F.text)
@@ -979,18 +1041,13 @@ async def handle_schedule_day(message: Message, state: FSMContext) -> None:
     if credentials is None:
         await state.set_state(RatingStates.waiting_for_login)
         await state.update_data(pending_action="schedule")
-        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        response = f"Сначала войдите в личный кабинет РЭУ.\n\n{LOGIN_PROMPT}"
         await _log_event(message, "schedule_day", result_status="login_required", response_text=response)
         await message.answer(response, reply_markup=_back_keyboard())
         return
 
     cached_schedule = await get_cached_schedule_snapshot(user_id)
     if cached_schedule is not None:
-        start_schedule_cache_refresh(
-            telegram_user_id=user_id,
-            credentials=credentials,
-            source="schedule_day",
-        )
         response = format_schedule_snapshot(cached_schedule, day_query)
         await _log_event(
             message,
@@ -1007,12 +1064,7 @@ async def handle_schedule_day(message: Message, state: FSMContext) -> None:
         await state.set_state(RatingStates.waiting_for_action)
         return
 
-    start_schedule_cache_refresh(
-        telegram_user_id=user_id,
-        credentials=credentials,
-        source="schedule_day_no_cache",
-    )
-    response = "Расписание еще не сохранено. Обновляю его в фоне, попробуйте еще раз через минуту."
+    response = "Расписание еще загружается из ЛКС. Я напишу, когда данные будут готовы."
     await _log_event(
         message,
         "schedule_day",
@@ -1032,13 +1084,19 @@ async def handle_subject(message: Message, state: FSMContext) -> None:
         await show_action_menu(message, state)
         return
     if _is_delete_data_request(message.text):
-        await ask_delete_data_confirmation(message, state)
+        await ask_delete_data_confirmation(message, state, delete_all=False)
+        return
+    if _is_delete_all_data_request(message.text):
+        await ask_delete_data_confirmation(message, state, delete_all=True)
         return
     if _is_check_again_request(message.text):
         await check_again(message, state)
         return
     if _is_notifications_request(message.text):
         await toggle_notifications(message, state)
+        return
+    if _is_announcements_request(message.text):
+        await toggle_announcements(message, state)
         return
     if _is_rating_request(message.text) or _normalize_message_text(message.text) == _normalize_message_text(RATING_ACTION_TEXT):
         await start_rating_flow(message, state)
@@ -1062,8 +1120,10 @@ async def handle_subject_without_state(message: Message, state: FSMContext) -> N
                 _is_start_button(message.text),
                 _is_back_button(message.text),
                 _is_delete_data_request(message.text),
+                _is_delete_all_data_request(message.text),
                 _is_check_again_request(message.text),
                 _is_notifications_request(message.text),
+                _is_announcements_request(message.text),
                 _is_rating_request(message.text),
                 _is_schedule_request(message.text),
                 _normalize_message_text(message.text) == _normalize_message_text(RATING_ACTION_TEXT),
@@ -1083,7 +1143,7 @@ async def handle_subject_without_state(message: Message, state: FSMContext) -> N
                 )
                 await state.set_state(RatingStates.waiting_for_password)
                 response = "Логин обновлен. Теперь введите пароль от личного кабинета РЭУ."
-                await _log_event(message, "rea_login", message_text=message.text, result_status="pending_login_updated_stateless", response_text=response)
+                await _log_event(message, "rea_login", message_text=_mask_login(message.text), result_status="pending_login_updated_stateless", response_text=response)
                 await message.answer(response, reply_markup=_back_keyboard())
                 return
 
@@ -1104,7 +1164,7 @@ async def handle_subject_without_state(message: Message, state: FSMContext) -> N
             )
             await state.set_state(RatingStates.waiting_for_password)
             response = "Теперь введите пароль от личного кабинета РЭУ."
-            await _log_event(message, "rea_login", message_text=message.text, result_status="accepted_stateless", response_text=response)
+            await _log_event(message, "rea_login", message_text=_mask_login(message.text), result_status="accepted_stateless", response_text=response)
             await message.answer(response, reply_markup=_back_keyboard())
             return
 
@@ -1112,13 +1172,19 @@ async def handle_subject_without_state(message: Message, state: FSMContext) -> N
         await show_action_menu(message, state)
         return
     if _is_delete_data_request(message.text):
-        await ask_delete_data_confirmation(message, state)
+        await ask_delete_data_confirmation(message, state, delete_all=False)
+        return
+    if _is_delete_all_data_request(message.text):
+        await ask_delete_data_confirmation(message, state, delete_all=True)
         return
     if _is_check_again_request(message.text):
         await check_again(message, state)
         return
     if _is_notifications_request(message.text):
         await toggle_notifications(message, state)
+        return
+    if _is_announcements_request(message.text):
+        await toggle_announcements(message, state)
         return
     if _is_rating_request(message.text) or _normalize_message_text(message.text) == _normalize_message_text(RATING_ACTION_TEXT):
         await start_rating_flow(message, state)
@@ -1147,7 +1213,7 @@ async def start_schedule_flow(message: Message, state: FSMContext) -> None:
     if credentials is None:
         await state.set_state(RatingStates.waiting_for_login)
         await state.update_data(pending_action="schedule")
-        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        response = f"Сначала войдите в личный кабинет РЭУ.\n\n{LOGIN_PROMPT}"
         await _log_event(message, "schedule_start", result_status="login_required", response_text=response)
         await message.answer(response, reply_markup=_back_keyboard())
         return
@@ -1173,7 +1239,7 @@ async def show_action_menu(message: Message, state: FSMContext, *, prefix: str |
     await message.answer(response, reply_markup=_action_keyboard(_telegram_user_id(message)))
 
 
-async def ask_delete_data_confirmation(message: Message, state: FSMContext) -> None:
+async def ask_delete_data_confirmation(message: Message, state: FSMContext, *, delete_all: bool) -> None:
     if not await _is_allowed(message):
         response = "Доступ запрещен."
         await _log_event(message, "delete_data", result_status="access_denied", response_text=response)
@@ -1181,7 +1247,12 @@ async def ask_delete_data_confirmation(message: Message, state: FSMContext) -> N
         return
 
     await state.set_state(RatingStates.confirming_delete_data)
-    response = "Выйти из аккаунта и удалить сохраненный логин, пароль, снимки баллов и расписания?"
+    await state.update_data(delete_all_data=delete_all)
+    response = (
+        "Удалить логин, пароль, снимки, историю действий и подписку на объявления?"
+        if delete_all
+        else "Выйти из аккаунта и удалить сохраненный логин, пароль, снимки баллов и расписания?"
+    )
     await _log_event(message, "delete_data", result_status="confirmation_requested", response_text=response)
     await message.answer(response, reply_markup=_confirm_delete_keyboard())
 
@@ -1200,11 +1271,20 @@ async def delete_user_data(message: Message, state: FSMContext) -> None:
         await message.answer(response)
         return
 
-    await asyncio.to_thread(_store().delete_credentials, user_id)
+    data = await state.get_data()
+    delete_all = bool(data.get("delete_all_data"))
+    if delete_all:
+        await asyncio.to_thread(_store().delete_all_user_data, user_id)
+    else:
+        await asyncio.to_thread(_store().delete_credentials, user_id)
     _forget_user_runtime_data(user_id)
     await state.clear()
     await state.set_state(RatingStates.waiting_for_action)
-    response = "Вы вышли из аккаунта. Чтобы снова пользоваться ботом, нажмите Старт и войдите в ЛКС."
+    response = (
+        "Все ваши данные удалены. Чтобы снова пользоваться ботом, нажмите Старт."
+        if delete_all
+        else "Вы вышли из аккаунта. Чтобы снова пользоваться ботом, нажмите Старт и войдите в ЛКС."
+    )
     await _log_event(message, "delete_data", result_status="deleted", response_text=response)
     await message.answer(response, reply_markup=_start_keyboard())
 
@@ -1226,7 +1306,7 @@ async def check_again(message: Message, state: FSMContext) -> None:
     credentials = _get_credentials(user_id)
     if credentials is None:
         await state.set_state(RatingStates.waiting_for_login)
-        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        response = f"Сначала войдите в личный кабинет РЭУ.\n\n{LOGIN_PROMPT}"
         await _log_event(message, "check_again", result_status="login_required", response_text=response)
         await message.answer(response, reply_markup=_back_keyboard())
         return
@@ -1236,6 +1316,7 @@ async def check_again(message: Message, state: FSMContext) -> None:
         telegram_user_id=user_id,
         credentials=credentials,
         source="manual_check",
+        initialize_notification_baseline=False,
     )
     await state.set_state(RatingStates.waiting_for_action)
     response = (
@@ -1268,10 +1349,16 @@ async def toggle_notifications(message: Message, state: FSMContext) -> None:
 
     enabled = not notification_settings_cache.get(user_id, True)
     notification_settings_cache[user_id] = enabled
-    asyncio.create_task(_save_notification_setting(user_id, enabled))
+    await _save_notification_setting(user_id, enabled)
     credentials = _get_credentials(user_id)
     if enabled and credentials is not None:
-        asyncio.create_task(refresh_user_baselines_if_available(user_id, credentials))
+        asyncio.create_task(
+            refresh_user_cache_if_available(
+                user_id,
+                credentials,
+                initialize_notification_baseline=True,
+            )
+        )
 
     response = (
         "Уведомления включены. Бот будет проверять изменения примерно раз в час. Текущий снимок обновится в фоне."
@@ -1281,6 +1368,31 @@ async def toggle_notifications(message: Message, state: FSMContext) -> None:
     await _log_event(
         message,
         "notifications",
+        result_status="enabled" if enabled else "disabled",
+        response_text=response,
+    )
+    await message.answer(response, reply_markup=_action_keyboard(user_id))
+    await state.set_state(RatingStates.waiting_for_action)
+
+
+async def toggle_announcements(message: Message, state: FSMContext) -> None:
+    if not await _is_allowed(message):
+        await message.answer("Доступ запрещен.")
+        return
+    user_id = _telegram_user_id(message)
+    if user_id is None:
+        await message.answer("Не удалось определить пользователя Telegram.")
+        return
+    enabled = not await asyncio.to_thread(_store().announcements_enabled, user_id)
+    await asyncio.to_thread(_store().set_announcements_enabled, user_id, enabled)
+    response = (
+        "Объявления администратора включены."
+        if enabled
+        else "Объявления администратора отключены."
+    )
+    await _log_event(
+        message,
+        "announcements",
         result_status="enabled" if enabled else "disabled",
         response_text=response,
     )
@@ -1303,13 +1415,6 @@ async def ask_subject_from_items(
     await message.answer(response, reply_markup=_subject_keyboard(items))
 
 
-async def fetch_rating_items(credentials) -> list[RatingItem]:
-    html = await asyncio.to_thread(
-        RatingClient(login=credentials.login, password=credentials.password).fetch_html
-    )
-    return parse_rating_items_from_html(html)
-
-
 async def save_rating_items_cache(telegram_user_id: int, items: list[RatingItem]) -> None:
     await asyncio.to_thread(
         _store().replace_rating_snapshots,
@@ -1327,71 +1432,6 @@ async def get_cached_rating_items(telegram_user_id: int) -> list[RatingItem]:
     else:
         rating_items_cache.pop(telegram_user_id, None)
     return items
-
-
-def start_rating_cache_refresh(
-    *,
-    telegram_user_id: int,
-    credentials,
-    source: str,
-) -> None:
-    existing_task = rating_cache_refresh_tasks.get(telegram_user_id)
-    if existing_task is not None and not existing_task.done():
-        return
-    if not _interactive_refresh_allowed(rating_cache_refresh_started_at, telegram_user_id):
-        return
-
-    task = asyncio.create_task(
-        refresh_rating_cache(
-            telegram_user_id=telegram_user_id,
-            credentials=credentials,
-            source=source,
-        )
-    )
-    rating_cache_refresh_tasks[telegram_user_id] = task
-    task.add_done_callback(
-        lambda finished_task: _finish_rating_cache_refresh(
-            telegram_user_id,
-            finished_task,
-        )
-    )
-
-
-async def refresh_rating_cache(
-    *,
-    telegram_user_id: int,
-    credentials,
-    source: str,
-) -> None:
-    try:
-        items = await fetch_rating_items(credentials)
-        await save_rating_items_cache(telegram_user_id, items)
-        await _log_store_event(
-            telegram_user_id=telegram_user_id,
-            event_type="rating_cache_refresh",
-            result_status="success",
-            response_text=f"source={source} subjects={len(items)}",
-        )
-    except (RatingFetchError, RatingParseError) as exc:
-        await _log_store_event(
-            telegram_user_id=telegram_user_id,
-            event_type="rating_cache_refresh",
-            result_status="failed",
-            response_text=f"source={source}",
-            error_message=str(exc),
-        )
-
-
-def _finish_rating_cache_refresh(telegram_user_id: int, task: asyncio.Task) -> None:
-    if rating_cache_refresh_tasks.get(telegram_user_id) is task:
-        rating_cache_refresh_tasks.pop(telegram_user_id, None)
-
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        logging.info("Rating cache refresh task was cancelled")
-    except Exception:
-        logging.exception("Rating cache refresh task failed")
 
 
 async def get_cached_schedule_snapshot(telegram_user_id: int) -> ScheduleSnapshot | None:
@@ -1425,85 +1465,13 @@ async def save_schedule_snapshot_cache(
     )
 
 
-def start_schedule_cache_refresh(
-    *,
-    telegram_user_id: int,
-    credentials,
-    source: str,
-) -> None:
-    existing_task = schedule_cache_refresh_tasks.get(telegram_user_id)
-    if existing_task is not None and not existing_task.done():
-        return
-    if not _interactive_refresh_allowed(schedule_cache_refresh_started_at, telegram_user_id):
-        return
-
-    task = asyncio.create_task(
-        refresh_schedule_cache(
-            telegram_user_id=telegram_user_id,
-            credentials=credentials,
-            source=source,
-        )
-    )
-    schedule_cache_refresh_tasks[telegram_user_id] = task
-    task.add_done_callback(
-        lambda finished_task: _finish_schedule_cache_refresh(
-            telegram_user_id,
-            finished_task,
-        )
-    )
-
-
-async def refresh_schedule_cache(
-    *,
-    telegram_user_id: int,
-    credentials,
-    source: str,
-) -> None:
-    try:
-        html = await asyncio.to_thread(
-            ScheduleClient(login=credentials.login, password=credentials.password).fetch_week_html
-        )
-        schedule_hash, schedule_text, schedule_key, _ = build_schedule_snapshot(html)
-        await save_schedule_snapshot_cache(
-            telegram_user_id=telegram_user_id,
-            schedule_key=schedule_key,
-            schedule_hash=schedule_hash,
-            schedule_text=schedule_text,
-        )
-        await _log_store_event(
-            telegram_user_id=telegram_user_id,
-            event_type="schedule_cache_refresh",
-            result_status="success",
-            response_text=f"source={source} lessons={len(schedule_text.splitlines())}",
-        )
-    except (ScheduleFetchError, ScheduleParseError) as exc:
-        await _log_store_event(
-            telegram_user_id=telegram_user_id,
-            event_type="schedule_cache_refresh",
-            result_status="failed",
-            response_text=f"source={source}",
-            error_message=str(exc),
-        )
-
-
-def _finish_schedule_cache_refresh(telegram_user_id: int, task: asyncio.Task) -> None:
-    if schedule_cache_refresh_tasks.get(telegram_user_id) is task:
-        schedule_cache_refresh_tasks.pop(telegram_user_id, None)
-
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        logging.info("Schedule cache refresh task was cancelled")
-    except Exception:
-        logging.exception("Schedule cache refresh task failed")
-
-
 def start_initial_baseline_refresh(
     *,
     bot: Bot,
     telegram_user_id: int,
     credentials,
     source: str,
+    initialize_notification_baseline: bool = True,
 ) -> bool:
     existing_task = initial_baseline_refresh_tasks.get(telegram_user_id)
     if existing_task is not None and not existing_task.done():
@@ -1515,6 +1483,7 @@ def start_initial_baseline_refresh(
             telegram_user_id=telegram_user_id,
             credentials=credentials,
             source=source,
+            initialize_notification_baseline=initialize_notification_baseline,
         )
     )
     initial_baseline_refresh_tasks[telegram_user_id] = task
@@ -1533,6 +1502,7 @@ async def refresh_initial_baseline_and_notify(
     telegram_user_id: int,
     credentials,
     source: str,
+    initialize_notification_baseline: bool,
 ) -> None:
     delays = _env_float_list("INITIAL_SYNC_RETRY_DELAYS_SECONDS", (0.0, 20.0, 40.0))
     started_at = time.monotonic()
@@ -1558,7 +1528,11 @@ async def refresh_initial_baseline_and_notify(
 
         try:
             status = await asyncio.wait_for(
-                refresh_user_baselines_if_available(telegram_user_id, credentials),
+                refresh_user_cache_if_available(
+                    telegram_user_id,
+                    credentials,
+                    initialize_notification_baseline=initialize_notification_baseline,
+                ),
                 timeout=min(attempt_timeout, remaining),
             )
         except TimeoutError:
@@ -1596,6 +1570,11 @@ async def refresh_initial_baseline_and_notify(
             ),
             reply_markup=_action_keyboard(telegram_user_id),
         )
+    await asyncio.to_thread(
+        _store().schedule_sync_retry,
+        telegram_user_id,
+        "initial sync did not finish within deadline",
+    )
     await _log_store_event(
         telegram_user_id=telegram_user_id,
         event_type="initial_sync",
@@ -1618,18 +1597,19 @@ def _finish_initial_baseline_refresh(telegram_user_id: int, task: asyncio.Task) 
 
 def format_schedule_snapshot(snapshot: ScheduleSnapshot, day_query: str) -> str:
     groups = _group_schedule_snapshot_lines(snapshot.schedule_text)
+    footer = f"\n\nДанные обновлены: {_format_updated_at(snapshot.updated_at)}"
     if _is_full_schedule_request(day_query):
         if not groups:
             return "Расписание на текущую неделю пока пустое."
         parts = ["Расписание на текущую неделю"]
         parts.extend(_format_cached_schedule_day(day_title, lessons) for day_title, lessons in groups)
-        return "\n\n".join(parts)
+        return "\n\n".join(parts) + footer
 
     normalized_day = _normalize_message_text(day_query)
     for day_title, lessons in groups:
         weekday = day_title.split(",", 1)[0]
         if _normalize_message_text(weekday) == normalized_day:
-            return _format_cached_schedule_day(day_title, lessons)
+            return _format_cached_schedule_day(day_title, lessons) + footer
 
     return "На сайте расписания нет выбранного дня для текущей недели."
 
@@ -1742,19 +1722,20 @@ async def start_rating_flow(message: Message, state: FSMContext) -> None:
     if credentials is None:
         await state.set_state(RatingStates.waiting_for_login)
         await state.update_data(pending_action="rating")
-        response = "Сначала войдите в личный кабинет РЭУ. Введите логин."
+        response = f"Сначала войдите в личный кабинет РЭУ.\n\n{LOGIN_PROMPT}"
         await _log_event(message, "rating_start", result_status="login_required", response_text=response)
         await message.answer(response, reply_markup=_back_keyboard())
         return
 
     cached_items = await get_cached_rating_items(user_id)
     if cached_items:
-        start_rating_cache_refresh(
-            telegram_user_id=user_id,
-            credentials=credentials,
-            source="rating_start",
+        updated_at = await asyncio.to_thread(_store().get_rating_updated_at, user_id)
+        await ask_subject_from_items(
+            message,
+            state,
+            cached_items,
+            prefix=f"Последнее обновление: {_format_updated_at(updated_at)}",
         )
-        await ask_subject_from_items(message, state, cached_items)
         return
 
     start_initial_baseline_refresh(
@@ -1806,12 +1787,6 @@ async def answer_subject(message: Message) -> None:
 
     cached_items = await get_cached_rating_items(user_id)
     if cached_items:
-        start_rating_cache_refresh(
-            telegram_user_id=user_id,
-            credentials=credentials,
-            source="subject_query",
-        )
-
         cached_item = find_subject_score(cached_items, subject_query)
         if cached_item is None:
             available = ", ".join(sorted({entry.subject for entry in cached_items})[:10])
@@ -1828,7 +1803,8 @@ async def answer_subject(message: Message) -> None:
             await message.answer(response, reply_markup=_subject_keyboard(cached_items))
             return
 
-        response = format_rating_item(cached_item)
+        updated_at = await asyncio.to_thread(_store().get_rating_updated_at, user_id)
+        response = format_rating_item(cached_item, updated_at=updated_at)
         await _log_event(
             message,
             "subject_query",
@@ -1859,7 +1835,8 @@ async def answer_subject(message: Message) -> None:
     await message.answer(response, reply_markup=_action_keyboard(user_id))
 
 
-def format_rating_item(item: RatingItem) -> str:
+def format_rating_item(item: RatingItem, *, updated_at: str | None = None) -> str:
+    footer = f"\n\nДанные обновлены: {_format_updated_at(updated_at)}"
     if any([item.attendance, item.control, item.creative, item.intermediate]):
         return (
             f"{item.subject}\n"
@@ -1868,9 +1845,10 @@ def format_rating_item(item: RatingItem) -> str:
             f"Творческий рейтинг: {item.creative or '-'}\n"
             f"Промежуточная аттестация: {item.intermediate or '-'}\n"
             f"Итого: {item.total}"
+            f"{footer}"
         )
 
-    return f"{item.subject}: {item.total}"
+    return f"{item.subject}: {item.total}{footer}"
 
 
 def rating_items_to_snapshots(items: list[RatingItem]) -> list[RatingSnapshot]:
@@ -1885,6 +1863,21 @@ def rating_items_to_snapshots(items: list[RatingItem]) -> list[RatingSnapshot]:
         )
         for item in items
     ]
+
+
+def validate_rating_items(
+    items: list[RatingItem],
+    previous: dict[str, RatingSnapshot] | None = None,
+) -> None:
+    subjects = [item.subject.strip() for item in items if item.subject.strip()]
+    if not subjects:
+        raise RatingParseError("ЛКС вернул пустой список предметов.")
+    if len(subjects) != len(set(subjects)):
+        raise RatingParseError("ЛКС вернул повторяющиеся предметы, снимок не сохранен.")
+    if previous and len(subjects) < max(1, int(len(previous) * 0.6)):
+        raise RatingParseError(
+            f"ЛКС вернул только {len(subjects)} из {len(previous)} предметов, снимок не сохранен."
+        )
 
 
 def _clean_rating_value(value: str | None) -> str:
@@ -1945,7 +1938,8 @@ async def save_schedule_baseline_if_available(
     password: str | None = None,
     html: str | None = None,
     fetch_error: str | None = None,
-) -> None:
+    initialize_notification_baseline: bool = True,
+) -> bool:
     if fetch_error:
         await _log_store_event(
             telegram_user_id=telegram_user_id,
@@ -1953,7 +1947,7 @@ async def save_schedule_baseline_if_available(
             result_status="baseline_failed",
             error_message=fetch_error,
         )
-        return
+        return False
 
     try:
         if html is None:
@@ -1967,12 +1961,21 @@ async def save_schedule_baseline_if_available(
             schedule_hash=schedule_hash,
             schedule_text=schedule_text,
         )
+        if initialize_notification_baseline:
+            await asyncio.to_thread(
+                _store().save_schedule_notification_snapshot,
+                telegram_user_id=telegram_user_id,
+                schedule_key=schedule_key,
+                schedule_hash=schedule_hash,
+                schedule_text=schedule_text,
+            )
         await _log_store_event(
             telegram_user_id=telegram_user_id,
             event_type="schedule_monitor",
             result_status="baseline_saved",
             response_text=f"lessons={len(schedule_text.splitlines())}",
         )
+        return True
     except (ScheduleFetchError, ScheduleParseError) as exc:
         await _log_store_event(
             telegram_user_id=telegram_user_id,
@@ -1980,9 +1983,15 @@ async def save_schedule_baseline_if_available(
             result_status="baseline_failed",
             error_message=str(exc),
         )
+        return False
 
 
-async def refresh_user_baselines_if_available(telegram_user_id: int, credentials) -> str | None:
+async def refresh_user_cache_if_available(
+    telegram_user_id: int,
+    credentials,
+    *,
+    initialize_notification_baseline: bool,
+) -> str | None:
     try:
         rating_html, schedule_html, schedule_error = await asyncio.to_thread(
             fetch_rating_and_schedule_html_once,
@@ -1990,21 +1999,40 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             password=credentials.password,
         )
         items = parse_rating_items_from_html(rating_html)
+        validate_rating_items(items)
         await save_rating_items_cache(telegram_user_id, items)
-        await save_schedule_baseline_if_available(
+        if initialize_notification_baseline:
+            await asyncio.to_thread(
+                _store().replace_rating_notification_snapshots,
+                telegram_user_id=telegram_user_id,
+                snapshots=rating_items_to_snapshots(items),
+            )
+        schedule_saved = await save_schedule_baseline_if_available(
             telegram_user_id=telegram_user_id,
             html=schedule_html,
             fetch_error=schedule_error,
+            initialize_notification_baseline=initialize_notification_baseline,
         )
+        if schedule_saved and initialize_notification_baseline:
+            await asyncio.to_thread(_store().mark_sync_completed, telegram_user_id)
+        elif not schedule_saved:
+            await asyncio.to_thread(
+                _store().schedule_sync_retry,
+                telegram_user_id,
+                schedule_error or "schedule snapshot was not saved",
+            )
         await _log_store_event(
             telegram_user_id=telegram_user_id,
             event_type="notifications",
-            result_status="baseline_refreshed",
+            result_status="baseline_refreshed" if initialize_notification_baseline else "cache_refreshed",
             response_text=f"subjects={len(items)}",
         )
-        return "Готово. Баллы и расписание загружены, теперь можно пользоваться ботом."
+        if schedule_saved:
+            return "Готово. Баллы и расписание загружены, теперь можно пользоваться ботом."
+        return "Баллы загружены. Расписание пока не ответило, я продолжу обновлять его в фоне."
     except (RatingFetchError, RatingParseError) as exc:
         if isinstance(exc, ReaCaptchaRequired):
+            await asyncio.to_thread(_store().schedule_sync_retry, telegram_user_id, str(exc))
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="notifications",
@@ -2036,6 +2064,7 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             result_status="baseline_refresh_failed",
             error_message=str(exc),
         )
+        await asyncio.to_thread(_store().schedule_sync_retry, telegram_user_id, str(exc))
         return None
     except Exception as exc:
         logging.exception("Initial baseline refresh failed for user_id=%s", telegram_user_id)
@@ -2045,17 +2074,27 @@ async def refresh_user_baselines_if_available(telegram_user_id: int, credentials
             result_status="baseline_refresh_failed",
             error_message=str(exc),
         )
+        await asyncio.to_thread(_store().schedule_sync_retry, telegram_user_id, str(exc))
         return None
 
 
 def format_schedule_change_notification(previous_text: str, current_text: str) -> str:
     previous_lines = [line for line in previous_text.splitlines() if line.strip()]
     current_lines = [line for line in current_text.splitlines() if line.strip()]
-    previous_set = set(previous_lines)
-    current_set = set(current_lines)
-
-    added = [line for line in current_lines if line not in previous_set]
-    removed = [line for line in previous_lines if line not in current_set]
+    previous_counts = Counter(previous_lines)
+    current_counts = Counter(current_lines)
+    added_counts = current_counts - previous_counts
+    removed_counts = previous_counts - current_counts
+    added: list[str] = []
+    removed: list[str] = []
+    for line in current_lines:
+        if added_counts[line] > 0:
+            added.append(line)
+            added_counts[line] -= 1
+    for line in previous_lines:
+        if removed_counts[line] > 0:
+            removed.append(line)
+            removed_counts[line] -= 1
 
     lines = ["Изменилось расписание на текущую неделю:"]
     if added:
@@ -2076,16 +2115,23 @@ def format_new_week_schedule_notification(week) -> str:
 
 
 def infer_schedule_week_key_from_snapshot_text(schedule_text: str) -> str | None:
-    dates: list[str] = []
+    dates: list[datetime] = []
     for line in schedule_text.splitlines():
         day_part = line.split("|", 1)[0].strip()
         if "," not in day_part:
             continue
         _, date_value = day_part.split(",", 1)
         date_value = " ".join(date_value.split())
-        if date_value and date_value not in dates:
-            dates.append(date_value)
-    return "|".join(dates) if dates else None
+        try:
+            parsed = datetime.strptime(date_value, "%d.%m.%Y")
+        except ValueError:
+            continue
+        dates.append(parsed)
+    if not dates:
+        return None
+    first_date = min(dates)
+    monday = first_date - timedelta(days=first_date.weekday())
+    return f"monday:{monday:%Y-%m-%d}"
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
@@ -2094,70 +2140,63 @@ def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
 
     chunks: list[str] = []
     current = ""
-    for block in text.split("\n\n"):
-        candidate = f"{current}\n\n{block}" if current else block
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        current = block
-
-    if current:
-        chunks.append(current)
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            chunks.append(line[:limit].rstrip())
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current.rstrip())
+            current = ""
+        current += line
+    if current.strip():
+        chunks.append(current.rstrip())
     return chunks
 
 
-async def rating_monitor_loop(app: web.Application) -> None:
-    if not _env_bool("MONITOR_ENABLED", True):
-        logging.info("Rating monitor is disabled")
-        return
+def _notification_dedupe_key(event_type: str, telegram_user_id: int, text: str) -> str:
+    payload = f"{event_type}:{telegram_user_id}:{time.time_ns()}:{text}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
-    if not _env_bool("MONITOR_BACKGROUND_ENABLED", False):
-        logging.info("Background rating monitor is disabled")
-        return
 
-    initial_delay = max(_env_float("MONITOR_INITIAL_DELAY_SECONDS", 60.0), 0.0)
-    interval = max(_env_float("MONITOR_INTERVAL_SECONDS", 3600.0), 60.0)
-    jitter = max(_env_float("MONITOR_JITTER_SECONDS", 60.0), 0.0)
-
-    logging.info(
-        "Rating monitor started: initial_delay=%s interval=%s jitter=%s",
-        initial_delay,
-        interval,
-        jitter,
-    )
-    await asyncio.sleep(initial_delay)
-
-    while True:
+async def deliver_notification_outbox(bot: Bot) -> None:
+    notifications = await asyncio.to_thread(_store().list_due_notifications, 100)
+    for notification in notifications:
         try:
-            await run_locked_rating_monitor_cycle(app, source="background")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logging.exception("Rating monitor cycle failed")
-
-        sleep_for = interval + (random.uniform(0, jitter) if jitter else 0)
-        await asyncio.sleep(sleep_for)
-
-
-async def run_locked_rating_monitor_cycle(app: web.Application, *, source: str) -> bool:
-    lock = app["rating_monitor_lock"]
-    if lock.locked():
-        await _log_store_event(
-            telegram_user_id=None,
-            event_type="rating_monitor",
-            result_status="already_running",
-            response_text=f"source={source}",
-        )
-        return False
-
-    async with lock:
-        await run_rating_monitor_cycle(app["bot"], source=source)
-        return True
+            for part in split_telegram_text(notification.message_text):
+                await bot.send_message(chat_id=notification.telegram_user_id, text=part)
+            await asyncio.to_thread(_store().mark_notification_sent, notification.id)
+            await _log_store_event(
+                telegram_user_id=notification.telegram_user_id,
+                event_type=notification.event_type,
+                result_status="delivered",
+                response_text=f"outbox_id={notification.id}",
+            )
+        except TelegramRetryAfter as exc:
+            await asyncio.to_thread(
+                _store().mark_notification_retry,
+                notification.id,
+                str(exc),
+                int(float(exc.retry_after)) + 1,
+            )
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            await asyncio.to_thread(_store().deactivate_subscriber, notification.telegram_user_id, str(exc))
+            await asyncio.to_thread(_store().mark_notification_retry, notification.id, str(exc), 86400)
+        except Exception as exc:
+            delay_seconds = min(60 * (2 ** min(notification.attempts, 6)), 3600)
+            await asyncio.to_thread(
+                _store().mark_notification_retry,
+                notification.id,
+                str(exc),
+                delay_seconds,
+            )
+            logging.exception("Notification delivery failed for outbox_id=%s", notification.id)
 
 
 async def run_rating_monitor_cycle(bot: Bot, *, source: str) -> None:
+    await deliver_notification_outbox(bot)
     credentials = await asyncio.to_thread(_store().list_notification_credentials)
     logging.info("Rating monitor cycle started from %s for %s users", source, len(credentials))
     await _log_store_event(
@@ -2182,6 +2221,7 @@ async def run_rating_monitor_cycle(bot: Bot, *, source: str) -> None:
 
         if user_delay and index < len(credentials) - 1:
             await asyncio.sleep(user_delay)
+    await deliver_notification_outbox(bot)
 
 
 async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCredentials) -> bool:
@@ -2251,23 +2291,24 @@ async def check_user_rating_and_schedule_changes(bot: Bot, credentials: StoredCr
         return True
 
     await process_user_schedule_changes(bot, telegram_user_id, schedule_html)
+    await asyncio.to_thread(_store().mark_sync_completed, telegram_user_id)
     return True
 
 
 async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str) -> None:
     try:
         items = parse_rating_items_from_html(html)
-        previous = await asyncio.to_thread(_store().get_rating_snapshots, telegram_user_id)
+        previous = await asyncio.to_thread(_store().get_rating_notification_snapshots, telegram_user_id)
         snapshots = rating_items_to_snapshots(items)
+        validate_rating_items(items, previous)
+        await save_rating_items_cache(telegram_user_id, items)
 
         if not previous:
-            await save_rating_items_cache(telegram_user_id, items)
-            with contextlib.suppress(Exception):
-                await bot.send_message(
-                    chat_id=telegram_user_id,
-                    text="Готово. Баллы загружены, теперь можно пользоваться ботом.",
-                    reply_markup=_action_keyboard(telegram_user_id),
-                )
+            await asyncio.to_thread(
+                _store().replace_rating_notification_snapshots,
+                telegram_user_id=telegram_user_id,
+                snapshots=snapshots,
+            )
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="rating_monitor",
@@ -2279,7 +2320,11 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
         changes = collect_rating_changes(previous, items)
 
         if not changes:
-            await save_rating_items_cache(telegram_user_id, items)
+            await asyncio.to_thread(
+                _store().replace_rating_notification_snapshots,
+                telegram_user_id=telegram_user_id,
+                snapshots=snapshots,
+            )
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="rating_monitor",
@@ -2289,13 +2334,18 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
             return
 
         notification = format_rating_change_notification(changes)
-        await save_rating_items_cache(telegram_user_id, items)
-        for notification_part in split_telegram_text(notification):
-            await bot.send_message(chat_id=telegram_user_id, text=notification_part)
+        await asyncio.to_thread(
+            _store().replace_rating_notification_snapshots,
+            telegram_user_id=telegram_user_id,
+            snapshots=snapshots,
+            event_type="rating_change",
+            message_text=notification,
+            dedupe_key=_notification_dedupe_key("rating_change", telegram_user_id, notification),
+        )
         await _log_store_event(
             telegram_user_id=telegram_user_id,
             event_type="rating_change",
-            result_status="notified",
+            result_status="queued",
             response_text=notification,
         )
     except RatingParseError as exc:
@@ -2318,10 +2368,17 @@ async def process_user_rating_changes(bot: Bot, telegram_user_id: int, html: str
 async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: str) -> None:
     try:
         current_hash, current_text, current_key, current_week = build_schedule_snapshot(html)
-        previous = await asyncio.to_thread(_store().get_schedule_snapshot, telegram_user_id)
+        previous = await asyncio.to_thread(_store().get_schedule_notification_snapshot, telegram_user_id)
+        await save_schedule_snapshot_cache(
+            telegram_user_id=telegram_user_id,
+            schedule_key=current_key,
+            schedule_hash=current_hash,
+            schedule_text=current_text,
+        )
 
         if previous is None:
-            await save_schedule_snapshot_cache(
+            await asyncio.to_thread(
+                _store().save_schedule_notification_snapshot,
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
@@ -2335,9 +2392,10 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
             )
             return
 
-        previous_key = previous.schedule_key or infer_schedule_week_key_from_snapshot_text(previous.schedule_text)
+        previous_key = infer_schedule_week_key_from_snapshot_text(previous.schedule_text) or previous.schedule_key
         if previous_key is None:
-            await save_schedule_snapshot_cache(
+            await asyncio.to_thread(
+                _store().save_schedule_notification_snapshot,
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
@@ -2353,24 +2411,27 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
 
         if previous_key != current_key:
             notification = format_new_week_schedule_notification(current_week)
-            await save_schedule_snapshot_cache(
+            await asyncio.to_thread(
+                _store().save_schedule_notification_snapshot,
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
                 schedule_text=current_text,
+                event_type="schedule_week_change",
+                message_text=notification,
+                dedupe_key=_notification_dedupe_key("schedule_week_change", telegram_user_id, notification),
             )
-            for notification_part in split_telegram_text(notification):
-                await bot.send_message(chat_id=telegram_user_id, text=notification_part)
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="schedule_week_change",
-                result_status="notified",
+                result_status="queued",
                 response_text=notification,
             )
             return
 
         if previous.schedule_key is None and previous.schedule_hash == current_hash:
-            await save_schedule_snapshot_cache(
+            await asyncio.to_thread(
+                _store().save_schedule_notification_snapshot,
                 telegram_user_id=telegram_user_id,
                 schedule_key=current_key,
                 schedule_hash=current_hash,
@@ -2385,6 +2446,13 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
             return
 
         if previous.schedule_hash == current_hash:
+            await asyncio.to_thread(
+                _store().save_schedule_notification_snapshot,
+                telegram_user_id=telegram_user_id,
+                schedule_key=current_key,
+                schedule_hash=current_hash,
+                schedule_text=current_text,
+            )
             await _log_store_event(
                 telegram_user_id=telegram_user_id,
                 event_type="schedule_monitor",
@@ -2394,18 +2462,20 @@ async def process_user_schedule_changes(bot: Bot, telegram_user_id: int, html: s
             return
 
         notification = format_schedule_change_notification(previous.schedule_text, current_text)
-        await save_schedule_snapshot_cache(
+        await asyncio.to_thread(
+            _store().save_schedule_notification_snapshot,
             telegram_user_id=telegram_user_id,
             schedule_key=current_key,
             schedule_hash=current_hash,
             schedule_text=current_text,
+            event_type="schedule_change",
+            message_text=notification,
+            dedupe_key=_notification_dedupe_key("schedule_change", telegram_user_id, notification),
         )
-        for notification_part in split_telegram_text(notification):
-            await bot.send_message(chat_id=telegram_user_id, text=notification_part)
         await _log_store_event(
             telegram_user_id=telegram_user_id,
             event_type="schedule_change",
-            result_status="notified",
+            result_status="queued",
             response_text=notification,
         )
     except (ScheduleFetchError, ScheduleParseError) as exc:
@@ -2438,77 +2508,12 @@ def get_bot_token() -> str:
     return token
 
 
-def build_webhook_url() -> str:
-    webhook_url = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
-    if not webhook_url:
-        raise RuntimeError("WEBHOOK_URL не задан в переменных окружения")
-    if webhook_url.endswith("/webhook"):
-        return webhook_url
-    return f"{webhook_url}/webhook"
-
-
-def get_webhook_secret() -> str:
-    secret = os.getenv("WEBHOOK_SECRET", "").strip()
-    if not secret:
-        raise RuntimeError("WEBHOOK_SECRET не задан в переменных окружения")
-    return secret
-
-
-def get_monitor_run_secret() -> str:
-    secret = os.getenv("MONITOR_RUN_SECRET", "").strip()
-    if not secret:
-        raise RuntimeError("MONITOR_RUN_SECRET не задан в переменных окружения")
-    return secret
-
-
-async def health(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "reu-rating-bot"})
-
-
-async def trigger_monitor_run(request: web.Request) -> web.Response:
-    if not _env_bool("MONITOR_ENABLED", True):
-        return web.json_response({"status": "disabled"}, status=503)
-
-    expected_secret = get_monitor_run_secret()
-    received_secret = request.headers.get("X-Monitor-Secret", "")
-    if not hmac.compare_digest(received_secret, expected_secret):
-        return web.json_response({"error": "unauthorized"}, status=401)
-
-    existing_task = request.app.get("manual_rating_monitor_task")
-    if existing_task is not None and not existing_task.done():
-        return web.json_response({"status": "already_running"}, status=202)
-
-    task = asyncio.create_task(run_locked_rating_monitor_cycle(request.app, source="http"))
-    request.app["manual_rating_monitor_task"] = task
-    task.add_done_callback(_log_manual_monitor_task_result)
-    return web.json_response({"status": "started"}, status=202)
-
-
-def _log_manual_monitor_task_result(task: asyncio.Task) -> None:
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        logging.info("Manual rating monitor task was cancelled")
-    except Exception:
-        logging.exception("Manual rating monitor task failed")
-
-
-async def on_webhook_startup(bot: Bot, dispatcher: Dispatcher) -> None:
-    webhook_url = build_webhook_url()
-    await configure_bot_profile(bot)
-    await bot.set_webhook(
-        webhook_url,
-        secret_token=get_webhook_secret(),
-        allowed_updates=dispatcher.resolve_used_update_types(),
-    )
-    logging.info("Webhook set to %s", webhook_url)
-
-
 async def configure_bot_profile(bot: Bot) -> None:
     commands = [
         BotCommand(command="rating", description="Просмотр баллов"),
         BotCommand(command="schedule", description="Расписание пар"),
         BotCommand(command="check", description="Проверить снова"),
+        BotCommand(command="help", description="Помощь и удаление данных"),
         BotCommand(command="logout", description="Выйти из аккаунта"),
     ]
     await bot.set_my_commands(commands)
@@ -2516,46 +2521,6 @@ async def configure_bot_profile(bot: Bot) -> None:
         await bot.set_my_description(BOT_DESCRIPTION)
     with contextlib.suppress(Exception):
         await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
-
-
-async def start_monitor_task(app: web.Application) -> None:
-    app["rating_monitor_task"] = asyncio.create_task(rating_monitor_loop(app))
-
-
-async def stop_monitor_task(app: web.Application) -> None:
-    task = app.get("rating_monitor_task")
-    if task is None:
-        return
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-
-
-def run_webhook() -> None:
-    global store
-    store = UserStore()
-    _warm_runtime_caches()
-    bot = Bot(token=get_bot_token())
-    dispatcher = create_dispatcher()
-    dispatcher.startup.register(on_webhook_startup)
-
-    app = web.Application()
-    app["bot"] = bot
-    app["rating_monitor_lock"] = asyncio.Lock()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    app.router.add_post("/monitor/run", trigger_monitor_run)
-    SimpleRequestHandler(
-        dispatcher=dispatcher,
-        bot=bot,
-        secret_token=get_webhook_secret(),
-    ).register(app, path="/webhook")
-    setup_application(app, dispatcher, bot=bot)
-    app.on_startup.append(start_monitor_task)
-    app.on_cleanup.append(stop_monitor_task)
-
-    port = int(os.getenv("PORT", "10000"))
-    web.run_app(app, host="0.0.0.0", port=port)
 
 
 async def run_polling() -> None:
@@ -2575,10 +2540,40 @@ async def run_polling() -> None:
 async def run_monitor_once() -> None:
     global store
     store = UserStore()
-    _warm_runtime_caches()
     bot = Bot(token=get_bot_token())
     try:
         await run_rating_monitor_cycle(bot, source=os.getenv("MONITOR_SOURCE", "cli"))
+    finally:
+        await bot.session.close()
+
+
+async def run_pending_sync_once() -> None:
+    global store
+    store = UserStore()
+    bot = Bot(token=get_bot_token())
+    try:
+        credentials = await asyncio.to_thread(_store().list_due_sync_credentials, 20)
+        logging.info("Pending sync cycle started for %s users", len(credentials))
+        for item in credentials:
+            status = await refresh_user_cache_if_available(
+                item.telegram_user_id,
+                item,
+                initialize_notification_baseline=True,
+            )
+            if status and (
+                status.startswith("Готово.")
+                or status.startswith("ЛКС не принял")
+            ):
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        chat_id=item.telegram_user_id,
+                        text=status,
+                        reply_markup=_action_keyboard(item.telegram_user_id)
+                        if _get_credentials(item.telegram_user_id) is not None
+                        else _start_keyboard(),
+                    )
+            await asyncio.sleep(max(_env_float("SYNC_RETRY_USER_DELAY_SECONDS", 10.0), 0.0))
+        await deliver_notification_outbox(bot)
     finally:
         await bot.session.close()
 
@@ -2587,16 +2582,18 @@ def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO)
 
-    run_mode = os.getenv("RUN_MODE", "webhook").strip().casefold()
+    run_mode = os.getenv("RUN_MODE", "polling").strip().casefold()
     if run_mode == "monitor_once":
         asyncio.run(run_monitor_once())
         return
 
-    if run_mode == "polling":
-        asyncio.run(run_polling())
+    if run_mode == "sync_pending_once":
+        asyncio.run(run_pending_sync_once())
         return
 
-    run_webhook()
+    if run_mode != "polling":
+        raise RuntimeError(f"Неизвестный RUN_MODE: {run_mode}")
+    asyncio.run(run_polling())
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 [Unit]
-Description=REU Rating Telegram Bot Hourly Monitor
+Description=REU Rating Telegram Bot Watchdog
 After=network-online.target
 Wants=network-online.target
 
@@ -7,9 +7,8 @@ Wants=network-online.target
 Type=oneshot
 User=reubot
 Group=reubot
-WorkingDirectory=/opt/reu-rating-bot/app
 EnvironmentFile=/etc/reu-rating-bot.env
-ExecStart=/usr/bin/env RUN_MODE=monitor_once /opt/reu-rating-bot/.venv/bin/python /opt/reu-rating-bot/app/bot.py
+ExecStart=/usr/bin/python3 /opt/reu-rating-bot/app/deploy/watchdog.py
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -24,3 +23,4 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictRealtime=true
+

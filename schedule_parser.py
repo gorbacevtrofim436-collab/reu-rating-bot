@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from bs4 import BeautifulSoup
 
@@ -163,9 +164,12 @@ def schedule_snapshot_text(week: ScheduleWeek) -> str:
 
 
 def schedule_week_key(week: ScheduleWeek) -> str:
-    date_parts = [day.date for day in week.days if day.date]
-    if date_parts:
-        return "|".join(date_parts)
+    parsed_dates = [_parse_date(day.date) for day in week.days if day.date]
+    parsed_dates = [value for value in parsed_dates if value is not None]
+    if parsed_dates:
+        first_date = min(parsed_dates)
+        monday = first_date - timedelta(days=first_date.weekday())
+        return f"monday:{monday:%Y-%m-%d}"
     if week.week_num is not None:
         return f"week:{week.week_num}"
     return "|".join(day.title for day in week.days)
@@ -308,3 +312,14 @@ def _clean_place(value: str) -> str | None:
     if re.match(r"^\d+\s+корпус\s+", cleaned, flags=re.IGNORECASE):
         cleaned = re.sub(r"^(\d+\s+корпус)\s+", r"\1 - ", cleaned, flags=re.IGNORECASE)
     return cleaned or None
+
+
+def _parse_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    for pattern in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(value, pattern)
+        except ValueError:
+            continue
+    return None

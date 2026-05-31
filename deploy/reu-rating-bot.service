@@ -13,6 +13,20 @@ ExecStart=/opt/reu-rating-bot/.venv/bin/python /opt/reu-rating-bot/app/bot.py
 Restart=always
 RestartSec=3
 TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/reu-rating-bot/data
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target

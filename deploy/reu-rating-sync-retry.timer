@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry pending REU account sync every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=reu-rating-sync-retry.service
+
+[Install]
+WantedBy=timers.target
